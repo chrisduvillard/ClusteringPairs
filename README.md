@@ -37,7 +37,7 @@ The goal is to help traders and analysts explore relationships between different
 ```
 [Insert Screenshot of the main Streamlit app interface with sidebar controls]
 ```
-![Main Interface](docs/images/image.png)
+![Main Interface](docs/images/main_interface.png)
 
 
 **Example Placeholder 2: Pair Results Table**
