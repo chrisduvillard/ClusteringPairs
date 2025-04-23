@@ -34,21 +34,14 @@ The goal is to help traders and analysts explore relationships between different
 *(Please insert your screenshots here to showcase the application's interface and features. Good examples include: the main dashboard, technique selection, filtering options, results table, and visualization plots.)*
 
 **Example Placeholder 1: Main Interface**
-```
-[Insert Screenshot of the main Streamlit app interface with sidebar controls]
-```
 ![Main Interface](docs/images/main_interface.png)
 
 
 **Example Placeholder 2: Pair Results Table**
-```
-[Insert Screenshot showing the table of identified pairs for a selected technique]
-```
+![Table of Identified Pairs](docs/images/pair_table.png)
 
 **Example Placeholder 3: Pair Visualization**
-```
-[Insert Screenshot showing the normalized price chart and spread chart for a selected pair]
-```
+![Price Chart & Spread Chart](docs/images/pair_visualization.png)
 
 **Example Placeholder 4: Technique Comparison Tab**
 ```
