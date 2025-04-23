@@ -36,7 +36,6 @@ The goal is to help traders and analysts explore relationships between different
 **Example Placeholder 1: Main Interface**
 ![Main Interface](docs/images/main_interface.png)
 
-
 **Example Placeholder 2: Pair Results Table**
 ![Table of Identified Pairs](docs/images/pair_table.png)
 
@@ -44,9 +43,8 @@ The goal is to help traders and analysts explore relationships between different
 ![Price Chart & Spread Chart](docs/images/pair_visualization.png)
 
 **Example Placeholder 4: Technique Comparison Tab**
-```
-[Insert Screenshot showing the comparison tab with results from multiple techniques]
-```
+![Comparison of Multiple Techniques](docs/images/comparison.png)
+
 
 ## Setup and Installation
 
