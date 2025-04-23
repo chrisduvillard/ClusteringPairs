@@ -31,18 +31,16 @@ The goal is to help traders and analysts explore relationships between different
 
 ## Screenshots
 
-*(Please insert your screenshots here to showcase the application's interface and features. Good examples include: the main dashboard, technique selection, filtering options, results table, and visualization plots.)*
-
-**Example Placeholder 1: Main Interface**
+**Main Interface**
 ![Main Interface](docs/images/main_interface.png)
 
-**Example Placeholder 2: Pair Results Table**
+**Pair Results Table**
 ![Table of Identified Pairs](docs/images/pair_table.png)
 
-**Example Placeholder 3: Pair Visualization**
+**Pair Visualization**
 ![Price Chart & Spread Chart](docs/images/pair_visualization.png)
 
-**Example Placeholder 4: Technique Comparison Tab**
+**Technique Comparison Tab**
 ![Comparison of Multiple Techniques](docs/images/comparison.png)
 
 

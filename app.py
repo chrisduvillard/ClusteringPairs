@@ -9,12 +9,13 @@ import statsmodels.api as sm
 import traceback
 import datetime
 import time # For DTW/MI timing info
+import io # Required for reading uploaded file buffer
 
 # --- ML/Stats Imports ---
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
-from sklearn.feature_selection import mutual_info_regression # For Mutual Information
-from dtaidistance import dtw # For Dynamic Time Warping
+from sklearn.preprocessing import StandardScaler # Added import
+from sklearn.cluster import KMeans # Added import
+from sklearn.feature_selection import mutual_info_regression # Added import
+from dtaidistance import dtw # Added import
 
 # --- Configuration ---
 DEFAULT_WATCHLIST = "Fut_Norgate" # Use your watchlist name
@@ -156,7 +157,7 @@ TECHNIQUE_INFO = {
 
 # --- Helper Functions ---
 def get_instrument_name(norgate_ticker, ticker_map):
-    """Gets the full instrument name from the Norgate ticker."""
+    """Gets the full instrument name from the Norgate ticker OR returns the ticker itself if not mapped (for uploaded files)."""
     return ticker_map.get(norgate_ticker, norgate_ticker) # Return ticker if not found
 
 # --- Data Loading Functions ---
@@ -181,7 +182,7 @@ def filter_symbols_by_map(symbols, ticker_map):
 
 @st.cache_data(ttl=3600) # Cache for 1 hour
 def fetch_futures_data(_symbols, _start_date, _end_date):
-    """Fetches historical price data for a list of known (mapped) futures symbols."""
+    """Fetches historical price data for a list of known (mapped) futures symbols from Norgate."""
     if not _symbols:
         st.warning("⚠️ No mapped symbols provided to fetch data for.")
         return pd.DataFrame(), [] # Return empty DataFrame and list
@@ -252,10 +253,78 @@ def fetch_futures_data(_symbols, _start_date, _end_date):
         progress_placeholder.empty()
         return pd.DataFrame(), []
     except Exception as e:
-        st.error(f"❌ Unexpected error during data fetching: {e}")
+        st.error(f"❌ Unexpected error during Norgate data fetching: {e}") # Clarified error source
         st.error(traceback.format_exc())
         progress_placeholder.empty()
         return pd.DataFrame(), []
+
+@st.cache_data(ttl=3600) # Cache uploaded data as well
+def load_uploaded_data(uploaded_file, sheet_name=None): # Added sheet_name parameter
+    """Loads and processes data from an uploaded CSV or XLSX file."""
+    if uploaded_file is None:
+        return pd.DataFrame(), []
+
+    try:
+        # Read the file from the buffer
+        file_name = uploaded_file.name
+        if file_name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        elif file_name.endswith(('.xlsx', '.xls')):
+            if sheet_name is None:
+                # Should ideally not happen if UI logic is correct, but fallback
+                st.warning("⚠️ No sheet selected for Excel file, reading the first one.")
+                sheet_name = 0 # Default to first sheet if none provided
+            # Read the specified sheet
+            df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
+        else:
+            st.error("❌ Unsupported file format. Please upload a CSV or XLSX file.")
+            return pd.DataFrame(), []
+
+        if df.empty:
+            st.error(f"❌ Uploaded file ('{file_name}', Sheet: '{sheet_name}') is empty.")
+            return pd.DataFrame(), []
+
+        # --- Data Preprocessing ---
+        # Assume the first column is the date/time index
+        date_col = df.columns[0]
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        df = df.set_index(date_col)
+        df = df.sort_index() # Ensure chronological order
+
+        # Drop rows where the index is NaT (failed date parsing)
+        df = df.dropna(axis=0, how='all', subset=df.index.name, inplace=False)
+        if df.empty:
+            st.error(f"❌ No valid dates found in the first column ('{date_col}'). Please ensure it contains dates.")
+            return pd.DataFrame(), []
+
+        # Convert remaining columns to numeric, coercing errors to NaN
+        instrument_cols = df.columns
+        for col in instrument_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # Forward fill missing values
+        df = df.ffill()
+
+        # Drop columns that are entirely NaN after ffill
+        df = df.dropna(axis=1, how='all')
+
+        # Drop rows where *any* instrument still has NaN (ensures alignment)
+        df = df.dropna(axis=0, how='any')
+
+        if df.empty:
+            st.error("❌ No valid data remained after cleaning and alignment. Check for missing values or non-numeric data.")
+            return pd.DataFrame(), []
+
+        processed_symbols = df.columns.tolist()
+        st.success(f"✅ Successfully loaded and processed data for {len(processed_symbols)} instruments from '{file_name}' (Sheet: '{sheet_name}').")
+        return df, processed_symbols
+
+    except Exception as e:
+        sheet_info = f"(Sheet: '{sheet_name}')" if sheet_name is not None else ""
+        st.error(f"❌ Error processing uploaded file '{uploaded_file.name}' {sheet_info}: {e}")
+        st.error(traceback.format_exc())
+        return pd.DataFrame(), []
+
 
 # --- Calculation Functions ---
 @st.cache_data
@@ -794,419 +863,519 @@ def find_mi_pairs(_price_df):
 st.set_page_config(layout="wide", page_title="📈 Futures Pair Finder")
 
 # --- Header ---
-st.title("📈 Futures Market Pair Detector")
+st.title("📈 Market Pair Detector") # Generalized title
 st.markdown("""
-Welcome! This application analyzes historical futures price data to identify potential pairs based on various statistical and machine learning techniques.
-Select your desired instrument, analysis technique(s), date range, and filters from the sidebar to begin.
+Welcome! This application analyzes historical time series data to identify potential pairs based on various statistical and machine learning techniques.
+Select your data source, desired instrument, analysis technique(s), date range, and filters from the sidebar to begin.
 """)
-st.write(f"Using data from Norgate watchlist: **{DEFAULT_WATCHLIST}**")
+# Display data source info later, after selection
+
 st.write(f"🕒 App Run Time: {pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d %H:%M:%S %Z')}")
 st.divider() # Add a visual separator
 
 # --- Sidebar Controls ---
 st.sidebar.header("⚙️ Analysis Configuration")
-st.sidebar.markdown("Configure the data period, instrument, techniques, and filters.")
+st.sidebar.markdown("Configure the data source, period, instrument, techniques, and filters.")
+
+# --- Data Source Selection ---
+st.sidebar.subheader("💾 Data Source")
+data_source = st.sidebar.radio(
+    "Select Data Source:",
+    ("Norgate Data", "Uploaded File"),
+    key="data_source_radio",
+    horizontal=True,
+)
+
+uploaded_file = None
+selected_sheet_name = None # Initialize sheet name variable
+
+if data_source == "Uploaded File":
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload CSV or XLSX file",
+        type=["csv", "xlsx", "xls"],
+        key="file_uploader",
+        help="Expected format: First column as Date/Time, subsequent columns as instrument prices."
+    )
+    if uploaded_file is not None:
+        # --- Sheet Selection for Excel ---
+        if uploaded_file.name.endswith(('.xlsx', '.xls')):
+            try:
+                # Use BytesIO to avoid issues with Streamlit's UploadedFile object
+                excel_file_buffer = io.BytesIO(uploaded_file.getvalue())
+                xls = pd.ExcelFile(excel_file_buffer)
+                sheet_names = xls.sheet_names
+                if not sheet_names:
+                    st.sidebar.error("❌ Excel file contains no sheets.")
+                    uploaded_file = None # Invalidate upload
+                else:
+                    selected_sheet_name = st.sidebar.selectbox(
+                        "Select Sheet:",
+                        options=sheet_names,
+                        index=0,
+                        key="sheet_selector"
+                    )
+            except Exception as e:
+                st.sidebar.error(f"❌ Error reading Excel sheets: {e}")
+                uploaded_file = None # Invalidate upload if sheets can't be read
+        else:
+            # For CSV files, sheet_name is not applicable
+            selected_sheet_name = None
+
+elif data_source == "Norgate Data":
+    st.sidebar.caption(f"Using Norgate watchlist: **{DEFAULT_WATCHLIST}**")
+
 
 # --- Data Options ---
 st.sidebar.subheader("🗓️ Data Period")
-# Date Range Selection
+# Date Range Selection - Keep defaults, but note they might be overridden by uploaded file range
 today = datetime.date.today()
-# Default start: 3 years ago, ensure it doesn't go beyond a reasonable limit if needed
 default_start = today - datetime.timedelta(days=5*365)
-start_date = st.sidebar.date_input("Start Date", default_start, max_value=today - datetime.timedelta(days=1), key="start_date_input")
-end_date = st.sidebar.date_input("End Date", today, max_value=today, key="end_date_input")
+start_date_input = st.sidebar.date_input("Start Date", default_start, max_value=today - datetime.timedelta(days=1), key="start_date_input")
+end_date_input = st.sidebar.date_input("End Date", today, max_value=today, key="end_date_input")
 
-if start_date >= end_date:
+if start_date_input >= end_date_input:
     st.sidebar.error("❌ Error: Start date must be before end date.")
     st.stop() # Stop execution if dates are invalid
 
 st.sidebar.divider() # Separator
 
-# --- Load Symbols & Filter ---
-all_symbols = load_watchlist_symbols(DEFAULT_WATCHLIST)
-mapped_symbols, skipped_symbols = filter_symbols_by_map(all_symbols, TICKER_MAP)
+# --- Initialize variables ---
+price_data = pd.DataFrame()
+available_symbols = []
+instrument_names = {}
+name_to_ticker = {}
+skipped_symbols = [] # Specific to Norgate
 
-# Display skipped symbols warning (uncommented)
-if skipped_symbols:
-    with st.sidebar.expander(f"⚠️ Skipped {len(skipped_symbols)} Symbols", expanded=False):
-        skipped_names = [get_instrument_name(s, TICKER_MAP) for s in skipped_symbols]
-        st.warning(f"Ignoring symbols not found in TICKER_MAP: {', '.join(skipped_names)}. Update TICKER_MAP to include them if desired.")
+# --- Load Data Based on Source ---
+if data_source == "Norgate Data":
+    # --- Load Symbols & Filter ---
+    all_symbols = load_watchlist_symbols(DEFAULT_WATCHLIST)
+    mapped_symbols, skipped_symbols = filter_symbols_by_map(all_symbols, TICKER_MAP)
 
-if not mapped_symbols:
-    st.error("❌ No symbols from the watchlist are defined in the TICKER_MAP. Cannot proceed.")
+    # Display skipped symbols warning (only for Norgate)
+    if skipped_symbols:
+        with st.sidebar.expander(f"⚠️ Skipped {len(skipped_symbols)} Norgate Symbols", expanded=False):
+            skipped_names = [get_instrument_name(s, TICKER_MAP) for s in skipped_symbols]
+            st.warning(f"Ignoring Norgate symbols not found in TICKER_MAP: {', '.join(skipped_names)}. Update TICKER_MAP to include them if desired.")
+
+    if not mapped_symbols:
+        st.error("❌ No symbols from the Norgate watchlist are defined in the TICKER_MAP. Cannot proceed with Norgate data.")
+        # Don't st.stop() here, user might switch to upload
+    else:
+        # --- Fetch Data for MAPPED symbols ---
+        price_data, available_symbols = fetch_futures_data(mapped_symbols, start_date_input, end_date_input)
+        # --- Map Tickers to Names for UI (Norgate) ---
+        if not price_data.empty:
+            instrument_names = {ticker: get_instrument_name(ticker, TICKER_MAP) for ticker in available_symbols}
+
+elif data_source == "Uploaded File":
+    if uploaded_file is not None:
+        # Pass the selected sheet name (will be None for CSV)
+        price_data, available_symbols = load_uploaded_data(uploaded_file, selected_sheet_name)
+        # Filter data based on sidebar date range AFTER loading
+        if not price_data.empty:
+            # Ensure index is datetime before filtering
+            price_data.index = pd.to_datetime(price_data.index)
+            start_datetime = pd.to_datetime(start_date_input)
+            end_datetime = pd.to_datetime(end_date_input)
+
+            # Filter based on date part of the index
+            price_data = price_data[
+                (price_data.index.normalize() >= start_datetime.normalize()) &
+                (price_data.index.normalize() <= end_datetime.normalize())
+            ]
+            # price_data = price_data[(price_data.index >= pd.to_datetime(start_date_input)) & (price_data.index <= pd.to_datetime(end_date_input))] # Original line kept for reference
+            if price_data.empty:
+                 st.warning("⚠️ No data from the uploaded file falls within the selected Start/End date range.")
+                 available_symbols = [] # Reset available symbols if date filter makes it empty
+            else:
+                 available_symbols = price_data.columns.tolist() # Update available symbols after date filtering
+                 # --- Use column headers as names (Uploaded File) ---
+                 instrument_names = {ticker: ticker for ticker in available_symbols} # Use ticker as name
+    else:
+        st.info("ℹ️ Please upload a CSV or XLSX file to proceed with the 'Uploaded File' option.")
+        # Don't st.stop(), allow user to upload
+
+# --- Check if data is available before proceeding ---
+if price_data.empty or not available_symbols:
+    if data_source == "Norgate Data" and not skipped_symbols and 'mapped_symbols' in locals() and not mapped_symbols:
+        pass # Error already shown if no mapped symbols for Norgate
+    elif data_source == "Uploaded File" and uploaded_file is None:
+        pass # Info message already shown about needing to upload
+    elif price_data.empty and available_symbols: # Should not happen, but safety check
+         st.warning("⚠️ Inconsistent state: Symbols available but no price data.")
+    elif price_data.empty and available_symbols: # General catch for empty dataframe after processing
+         st.warning("⚠️ No price data available for the selected source, symbols, and date range after processing.")
+    else:
+         st.warning("⚠️ No data available to analyze. Please check your data source, symbol mapping (if Norgate), file content, or date range.")
+    st.stop() # Stop if no data is ready for analysis
+
+
+# --- Instrument Selection (Common Logic) ---
+st.sidebar.subheader("🎯 Select Instrument")
+name_to_ticker = {v: k for k, v in instrument_names.items()}
+
+if not instrument_names:
+    st.error("❌ No instruments available for selection after data loading and processing. Cannot proceed.")
     st.stop()
 
-# --- Instrument Selection ---
-st.sidebar.subheader("🎯 Select Instrument")
-# --- Fetch Data for MAPPED symbols ---
-# Pass dates directly, cache handles changes
-price_data, available_symbols = fetch_futures_data(mapped_symbols, start_date, end_date)
+# Sort names alphabetically for dropdown
+sorted_instrument_names = sorted(instrument_names.values())
+selected_instrument_name = st.sidebar.selectbox(
+    "Find pairs for:", sorted_instrument_names,
+    index=0, # Default to the first instrument
+    label_visibility="visible", # Make label visible
+    key="instrument_select"
+    )
 
-# --- Main Panel Setup ---
-if price_data is not None and not price_data.empty:
-    # Ensure available_symbols reflects columns actually present after processing
-    available_symbols = price_data.columns.tolist()
-    if not available_symbols:
-        st.warning("⚠️ No price data available for any mapped symbols in the selected date range after processing.")
-        st.stop()
+if selected_instrument_name and selected_instrument_name in name_to_ticker:
+    selected_ticker = name_to_ticker[selected_instrument_name]
+else:
+    st.warning("⚠️ Selected instrument name not found or invalid.")
+    st.stop() # Stop if selection is somehow invalid
 
-    # --- Calculate Returns and Normalized Prices (needed for various calcs/plots) ---
-    returns_data = calculate_returns(price_data)
-    norm_price_data = normalize_prices(price_data) # Used for SSD, Clustering, DTW, MI, Spread Volatility, Plots
-    full_data_range_length = len(price_data.index) # For overlap calculation
+# --- Main Panel Setup (Common Logic) ---
+# Ensure available_symbols reflects columns actually present after processing
+available_symbols = price_data.columns.tolist() # Reconfirm based on final price_data
 
-    # --- Map Tickers to Names for UI ---
-    instrument_names = {ticker: get_instrument_name(ticker, TICKER_MAP) for ticker in available_symbols}
-    name_to_ticker = {v: k for k, v in instrument_names.items()}
+# --- Calculate Returns and Normalized Prices (needed for various calcs/plots) ---
+returns_data = calculate_returns(price_data)
+norm_price_data = normalize_prices(price_data) # Used for SSD, Clustering, DTW, MI, Spread Volatility, Plots
+full_data_range_length = len(price_data.index) # For overlap calculation
 
-    # --- Instrument Selection Dropdown (Sidebar) ---
-    if not instrument_names:
-        st.error("❌ No instruments available after data fetching and mapping. Cannot proceed.")
-        st.stop()
 
-    # Sort names alphabetically for dropdown
-    sorted_instrument_names = sorted(instrument_names.values())
-    selected_instrument_name = st.sidebar.selectbox(
-        "Find pairs for:", sorted_instrument_names,
-        index=0, # Default to the first instrument
-        label_visibility="visible", # Make label visible
-        key="instrument_select"
-        )
+st.sidebar.divider() # Separator
 
-    if selected_instrument_name and selected_instrument_name in name_to_ticker:
-        selected_ticker = name_to_ticker[selected_instrument_name]
+# --- Technique Selection (Context Dependent) ---
+st.sidebar.subheader("🔬 Analysis Technique(s)")
+# Selection widgets will be defined within tabs if needed, or use a general one here
+# For simplicity, let's keep single selection for "Pair Analysis" and multi for "Comparison"
+selected_technique_single = st.sidebar.selectbox(
+    "Technique for Single Analysis:", options=TECHNIQUES, index=0,
+    key="technique_select_single",
+    help="Select one technique for the 'Pair Analysis' tab."
+)
+selected_techniques_multi = st.sidebar.multiselect(
+    "Techniques for Comparison:", options=TECHNIQUES, default=[TECHNIQUES[0], TECHNIQUES[1]],
+    key="technique_select_multi",
+    help="Select multiple techniques for the 'Technique Comparison' tab."
+)
+
+# --- Display SINGLE Technique Info in Sidebar ---
+if selected_technique_single and selected_technique_single in TECHNIQUE_INFO:
+    with st.sidebar.expander(f"ℹ️ About: {selected_technique_single.split('(')[0].strip()}", expanded=False): # Start collapsed
+        info = TECHNIQUE_INFO[selected_technique_single]
+        st.markdown(f"**{info['brief_description']}**")
+        st.markdown(f"**Data Used:** {info['data_used']}") # Show data used upfront
+        st.markdown(f"**Stationarity:** {info['stationarity_note']}") # Show stationarity note
+        st.markdown("**Pros:**\n" + info['pros'])
+        st.markdown("**Cons:**\n" + info['cons'])
+        st.markdown(f"**Ideal Use Case:** {info['use_case']}")
+        st.markdown(f"**Key Differences:** {info['differences']}")
+
+    st.sidebar.divider() # Separator
+
+# --- Technique Specific Controls ---
+num_clusters = 0
+coint_p_value_threshold = 0.05
+corr_threshold = 0.7
+
+if selected_technique_single == TECHNIQUE_CLUSTERING:
+    # Determine sensible range for k
+    max_k = min(len(available_symbols) -1 , 25) # Use available_symbols count
+    default_k = min(max(2, len(available_symbols) // 5), 8) # Use available_symbols count
+    if max_k >= 2:
+        num_clusters = st.sidebar.slider("Number of Clusters (k)", min_value=2, max_value=max_k, value=default_k, key="k_slider")
     else:
-        st.warning("⚠️ Selected instrument name not found or invalid.")
-        st.stop() # Stop if selection is somehow invalid
+        st.sidebar.warning("⚠️ Not enough instruments for clustering (need at least 2).")
+        num_clusters = 0 # Disable clustering
 
-    st.sidebar.divider() # Separator
+elif selected_technique_single == TECHNIQUE_COINTEGRATION:
+    coint_p_value_threshold = st.sidebar.slider("Cointegration P-value Threshold", 0.01, 0.10, 0.05, 0.01, key="p_value_slider", format="%.2f", help="Lower p-value means stronger statistical evidence for cointegration (long-run equilibrium).")
 
-    # --- Technique Selection (Context Dependent) ---
-    st.sidebar.subheader("🔬 Analysis Technique(s)")
-    # Selection widgets will be defined within tabs if needed, or use a general one here
-    # For simplicity, let's keep single selection for "Pair Analysis" and multi for "Comparison"
-    selected_technique_single = st.sidebar.selectbox(
-        "Technique for Single Analysis:", options=TECHNIQUES, index=0,
-        key="technique_select_single",
-        help="Select one technique for the 'Pair Analysis' tab."
-    )
-    selected_techniques_multi = st.sidebar.multiselect(
-        "Techniques for Comparison:", options=TECHNIQUES, default=[TECHNIQUES[0], TECHNIQUES[1]],
-        key="technique_select_multi",
-        help="Select multiple techniques for the 'Technique Comparison' tab."
-    )
+elif selected_technique_single == TECHNIQUE_CORRELATION:
+    corr_threshold = st.sidebar.slider("Min. Absolute Correlation Threshold", 0.1, 0.99, 0.7, 0.05, key="corr_thresh_slider", format="%.2f", help="Minimum absolute correlation between daily returns to consider a pair.")
+# Add placeholder for techniques without specific parameters
+elif selected_technique_single in [TECHNIQUE_DISTANCE, TECHNIQUE_DTW, TECHNIQUE_MI]:
+    st.sidebar.caption("No specific parameters for this technique.")
+else:
+     st.sidebar.caption("Select a technique to see its parameters.")
 
-    # --- Display SINGLE Technique Info in Sidebar ---
-    if selected_technique_single and selected_technique_single in TECHNIQUE_INFO:
-        with st.sidebar.expander(f"ℹ️ About: {selected_technique_single.split('(')[0].strip()}", expanded=False): # Start collapsed
-            info = TECHNIQUE_INFO[selected_technique_single]
-            st.markdown(f"**{info['brief_description']}**")
-            st.markdown(f"**Data Used:** {info['data_used']}") # Show data used upfront
-            st.markdown(f"**Stationarity:** {info['stationarity_note']}") # Show stationarity note
-            st.markdown("**Pros:**\n" + info['pros'])
-            st.markdown("**Cons:**\n" + info['cons'])
-            st.markdown(f"**Ideal Use Case:** {info['use_case']}")
-            st.markdown(f"**Key Differences:** {info['differences']}")
+# --- Advanced Filtering Controls ---
+st.sidebar.subheader("🔍 Advanced Filters")
+min_overlap_pct = st.sidebar.slider(
+    "Minimum Data Overlap (%)", 0, 100, 80, 5, key="overlap_filter",
+    help="Minimum percentage of the selected date range where both instruments must have price data."
+)
+# Volatility of the SPREAD (normalized prices) - NOW Std Dev of Spread Values
+volatility_range = st.sidebar.slider(
+    "Spread Std Dev Range (Normalized)", 0.0, 3.0, (0.0, 1.0), 0.05, key="volatility_filter", # Adjusted range and label
+    help="Filter pairs based on the standard deviation of their normalized price spread (Z-score difference). Lower values suggest a more stable spread around its mean." # Adjusted help text
+)
+# Placeholder for Sector Filter (requires external data)
+# selected_sector = st.sidebar.selectbox("Filter by Sector:", ["All", "Energy", "Metals", ...], key="sector_filter")
 
-    st.sidebar.divider() # Separator
 
-    # --- Technique Specific Controls ---
-    num_clusters = 0
-    coint_p_value_threshold = 0.05
-    corr_threshold = 0.7
+st.sidebar.divider() # Add final divider
+st.sidebar.markdown("---")
+# Conditional Tip based on data source
+if data_source == "Norgate Data":
+    st.sidebar.info("💡 Tip: Update `TICKER_MAP` in the script to include all desired instruments from your Norgate watchlist.")
+else:
+    st.sidebar.info("💡 Tip: Ensure uploaded file has dates in the first column and numeric price data.")
+st.sidebar.markdown("---")
+st.sidebar.info("ℹ️ This app performs pair analysis on time series data.") # Generalized info
 
-    if selected_technique_single == TECHNIQUE_CLUSTERING:
-        # Determine sensible range for k
-        max_k = min(len(mapped_symbols) -1 , 25) # Ensure k < n_samples, reasonable upper limit
-        default_k = min(max(2, len(mapped_symbols) // 5), 8) # Sensible default
-        if max_k >= 2:
-            num_clusters = st.sidebar.slider("Number of Clusters (k)", min_value=2, max_value=max_k, value=default_k, key="k_slider")
+
+# --- Main Panel with Tabs ---
+tab1, tab2, tab3 = st.tabs(["📊 Pair Analysis", "⚖️ Technique Comparison", "❓ Help / Documentation"])
+
+with tab1:
+    # Display actual data range used
+    actual_start_date = price_data.index.min().strftime('%Y-%m-%d')
+    actual_end_date = price_data.index.max().strftime('%Y-%m-%d')
+
+    st.header(f"Single Technique Analysis: {selected_instrument_name}")
+    st.subheader(f"Using Technique: {selected_technique_single}")
+
+    # --- Display Analysis Summary ---
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(label="Selected Instrument", value=selected_instrument_name)
+    with col2:
+        st.metric(label="Analysis Technique", value=selected_technique_single.split('(')[0].strip())
+    with col3:
+        # Show the actual date range of the data being analyzed
+        st.metric(label="Data Range Analyzed", value=f"{actual_start_date} to {actual_end_date}")
+    st.divider()
+
+    # --- Find Pairs (Single Technique) ---
+    found_pairs_data = {}
+    metric_name, metric_format, sort_ascending = "", "", True
+    extra_metric_name, extra_metric_format = None, None
+    calculation_function = None
+
+    start_calc_time = time.time()
+    try:
+        if selected_technique_single == TECHNIQUE_COINTEGRATION:
+            calculation_function = find_cointegrated_pairs
+            found_pairs_data = calculation_function(price_data, significance_level=coint_p_value_threshold)
+            metric_name, metric_format, sort_ascending = "p_value", ".4f", True
+            extra_metric_name, extra_metric_format = "half_life", ".2f"
+        elif selected_technique_single == TECHNIQUE_CORRELATION:
+             if returns_data is None or returns_data.empty: raise ValueError("Returns data missing.")
+             calculation_function = find_correlated_pairs
+             found_pairs_data = calculation_function(returns_data, threshold=corr_threshold)
+             metric_name, metric_format, sort_ascending = "correlation", ".3f", False
+        elif selected_technique_single == TECHNIQUE_DISTANCE:
+             calculation_function = find_distance_pairs
+             found_pairs_data = calculation_function(price_data)
+             metric_name, metric_format, sort_ascending = "ssd", ".2f", True
+        elif selected_technique_single == TECHNIQUE_CLUSTERING:
+             if num_clusters < 2: raise ValueError("Clustering requires at least 2 clusters.")
+             calculation_function = find_cluster_pairs
+             found_pairs_data = calculation_function(price_data, num_clusters)
+             metric_name, metric_format, sort_ascending = "ssd", ".2f", True
+             extra_metric_name, extra_metric_format = "cluster", "d"
+        elif selected_technique_single == TECHNIQUE_DTW:
+             calculation_function = find_dtw_pairs
+             found_pairs_data = calculation_function(price_data)
+             metric_name, metric_format, sort_ascending = "dtw_distance", ".2f", True
+        elif selected_technique_single == TECHNIQUE_MI:
+             calculation_function = find_mi_pairs
+             found_pairs_data = calculation_function(price_data)
+             metric_name, metric_format, sort_ascending = "mutual_information", ".4f", False
+
+    except Exception as calc_error:
+         st.error(f"❌ An error occurred during the '{selected_technique_single}' calculation: {calc_error}")
+         st.error(traceback.format_exc())
+         found_pairs_data = {} # Reset pairs data on error
+
+    end_calc_time = time.time()
+    if calculation_function: # Only show timing if a calculation was attempted
+         st.info(f"ℹ️ Pair calculation using {selected_technique_single.split('(')[0].strip()} took {end_calc_time - start_calc_time:.2f} seconds (before filtering).")
+
+    # --- Filter and Display Results (Single Technique) ---
+    if selected_ticker in found_pairs_data and found_pairs_data[selected_ticker]:
+        raw_pairs_list = found_pairs_data[selected_ticker]
+        filtered_display_data = []
+        pair_names_for_selection = []
+
+        # Get series for the selected instrument once
+        series1_orig = price_data.get(selected_ticker)
+        series1_norm = norm_price_data.get(selected_ticker)
+
+        if series1_orig is None or series1_norm is None:
+             st.warning(f"⚠️ Data missing for selected instrument {selected_instrument_name}. Cannot process pairs.")
         else:
-            st.sidebar.warning("⚠️ Not enough mapped instruments for clustering (need at least 2).")
-            num_clusters = 0 # Disable clustering
+            # --- Add debugging output header ---
+            if DEBUG_MODE and raw_pairs_list:
+                st.write("--- DEBUG: Pre-Filter Pair Details ---") # Add a header for debug info
+                st.caption(f"Raw pairs found by {selected_technique_single.split('(')[0].strip()} before applying Overlap/Volatility filters:")
 
-    elif selected_technique_single == TECHNIQUE_COINTEGRATION:
-        coint_p_value_threshold = st.sidebar.slider("Cointegration P-value Threshold", 0.01, 0.10, 0.05, 0.01, key="p_value_slider", format="%.2f", help="Lower p-value means stronger statistical evidence for cointegration (long-run equilibrium).")
+            progress_filter = st.progress(0, text="Applying filters...")
+            total_raw_pairs = len(raw_pairs_list)
 
-    elif selected_technique_single == TECHNIQUE_CORRELATION:
-        corr_threshold = st.sidebar.slider("Min. Absolute Correlation Threshold", 0.1, 0.99, 0.7, 0.05, key="corr_thresh_slider", format="%.2f", help="Minimum absolute correlation between daily returns to consider a pair.")
-    # Add placeholder for techniques without specific parameters
-    elif selected_technique_single in [TECHNIQUE_DISTANCE, TECHNIQUE_DTW, TECHNIQUE_MI]:
-        st.sidebar.caption("No specific parameters for this technique.")
-    else:
-         st.sidebar.caption("Select a technique to see its parameters.")
+            for i, pair_info in enumerate(raw_pairs_list):
+                pair_ticker = pair_info.get('pair_with')
+                if not pair_ticker or pair_ticker not in instrument_names: continue
 
-    # --- Advanced Filtering Controls ---
-    st.sidebar.subheader("🔍 Advanced Filters")
-    min_overlap_pct = st.sidebar.slider(
-        "Minimum Data Overlap (%)", 0, 100, 80, 5, key="overlap_filter",
-        help="Minimum percentage of the selected date range where both instruments must have price data."
-    )
-    # Volatility of the SPREAD (normalized prices) - NOW Std Dev of Spread Values
-    volatility_range = st.sidebar.slider(
-        "Spread Std Dev Range (Normalized)", 0.0, 3.0, (0.0, 1.0), 0.05, key="volatility_filter", # Adjusted range and label
-        help="Filter pairs based on the standard deviation of their normalized price spread (Z-score difference). Lower values suggest a more stable spread around its mean." # Adjusted help text
-    )
-    # Placeholder for Sector Filter (requires external data)
-    # selected_sector = st.sidebar.selectbox("Filter by Sector:", ["All", "Energy", "Metals", ...], key="sector_filter")
+                series2_orig = price_data.get(pair_ticker)
+                series2_norm = norm_price_data.get(pair_ticker)
+                if series2_orig is None or series2_norm is None: continue # Skip if pair data missing
 
+                # 1. Calculate Overlap
+                overlap_pct = calculate_overlap_percentage(series1_orig, series2_orig, full_data_range_length)
 
-    st.sidebar.divider() # Add final divider
-    st.sidebar.markdown("---")
-    st.sidebar.info("💡 Tip: Update `TICKER_MAP` in the script to include all desired instruments from your watchlist.")
-    st.sidebar.markdown("---")
-    st.sidebar.info("ℹ️ This app uses Norgate Data for futures prices and performs pair analysis.")
+                # 2. Calculate Spread Volatility (Standard Deviation of Normalized Spread)
+                spread_vol = np.nan
+                common_norm_index = series1_norm.index.intersection(series2_norm.index)
+                if not common_norm_index.empty:
+                    spread_norm = series1_norm.loc[common_norm_index] - series2_norm.loc[common_norm_index]
+                    if not spread_norm.empty:
+                        # Calculate Std Dev of the spread values directly, not returns
+                        spread_vol = calculate_volatility(spread_norm, use_returns=False, annualize=False) # Changed parameters
 
-
-    # --- Main Panel with Tabs ---
-    tab1, tab2, tab3 = st.tabs(["📊 Pair Analysis", "⚖️ Technique Comparison", "❓ Help / Documentation"])
-
-    with tab1:
-        st.header(f"Single Technique Analysis: {selected_instrument_name}")
-        st.subheader(f"Using Technique: {selected_technique_single}")
-
-        # --- Display Analysis Summary ---
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric(label="Selected Instrument", value=selected_instrument_name)
-        with col2:
-            st.metric(label="Analysis Technique", value=selected_technique_single.split('(')[0].strip())
-        with col3:
-            st.metric(label="Date Range", value=f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-        st.divider()
-
-        # --- Find Pairs (Single Technique) ---
-        found_pairs_data = {}
-        metric_name, metric_format, sort_ascending = "", "", True
-        extra_metric_name, extra_metric_format = None, None
-        calculation_function = None
-
-        start_calc_time = time.time()
-        try:
-            if selected_technique_single == TECHNIQUE_COINTEGRATION:
-                calculation_function = find_cointegrated_pairs
-                found_pairs_data = calculation_function(price_data, significance_level=coint_p_value_threshold)
-                metric_name, metric_format, sort_ascending = "p_value", ".4f", True
-                extra_metric_name, extra_metric_format = "half_life", ".2f"
-            elif selected_technique_single == TECHNIQUE_CORRELATION:
-                 if returns_data is None or returns_data.empty: raise ValueError("Returns data missing.")
-                 calculation_function = find_correlated_pairs
-                 found_pairs_data = calculation_function(returns_data, threshold=corr_threshold)
-                 metric_name, metric_format, sort_ascending = "correlation", ".3f", False
-            elif selected_technique_single == TECHNIQUE_DISTANCE:
-                 calculation_function = find_distance_pairs
-                 found_pairs_data = calculation_function(price_data)
-                 metric_name, metric_format, sort_ascending = "ssd", ".2f", True
-            elif selected_technique_single == TECHNIQUE_CLUSTERING:
-                 if num_clusters < 2: raise ValueError("Clustering requires at least 2 clusters.")
-                 calculation_function = find_cluster_pairs
-                 found_pairs_data = calculation_function(price_data, num_clusters)
-                 metric_name, metric_format, sort_ascending = "ssd", ".2f", True
-                 extra_metric_name, extra_metric_format = "cluster", "d"
-            elif selected_technique_single == TECHNIQUE_DTW:
-                 calculation_function = find_dtw_pairs
-                 found_pairs_data = calculation_function(price_data)
-                 metric_name, metric_format, sort_ascending = "dtw_distance", ".2f", True
-            elif selected_technique_single == TECHNIQUE_MI:
-                 calculation_function = find_mi_pairs
-                 found_pairs_data = calculation_function(price_data)
-                 metric_name, metric_format, sort_ascending = "mutual_information", ".4f", False
-
-        except Exception as calc_error:
-             st.error(f"❌ An error occurred during the '{selected_technique_single}' calculation: {calc_error}")
-             st.error(traceback.format_exc())
-             found_pairs_data = {} # Reset pairs data on error
-
-        end_calc_time = time.time()
-        if calculation_function: # Only show timing if a calculation was attempted
-             st.info(f"ℹ️ Pair calculation using {selected_technique_single.split('(')[0].strip()} took {end_calc_time - start_calc_time:.2f} seconds (before filtering).")
-
-        # --- Filter and Display Results (Single Technique) ---
-        if selected_ticker in found_pairs_data and found_pairs_data[selected_ticker]:
-            raw_pairs_list = found_pairs_data[selected_ticker]
-            filtered_display_data = []
-            pair_names_for_selection = []
-
-            # Get series for the selected instrument once
-            series1_orig = price_data.get(selected_ticker)
-            series1_norm = norm_price_data.get(selected_ticker)
-
-            if series1_orig is None or series1_norm is None:
-                 st.warning(f"⚠️ Data missing for selected instrument {selected_instrument_name}. Cannot process pairs.")
-            else:
-                # --- Add debugging output header ---
-                if DEBUG_MODE and raw_pairs_list:
-                    st.write("--- DEBUG: Pre-Filter Pair Details ---") # Add a header for debug info
-                    st.caption(f"Raw pairs found by {selected_technique_single.split('(')[0].strip()} before applying Overlap/Volatility filters:")
-
-                progress_filter = st.progress(0, text="Applying filters...")
-                total_raw_pairs = len(raw_pairs_list)
-
-                for i, pair_info in enumerate(raw_pairs_list):
-                    pair_ticker = pair_info.get('pair_with')
-                    if not pair_ticker or pair_ticker not in instrument_names: continue
-
-                    series2_orig = price_data.get(pair_ticker)
-                    series2_norm = norm_price_data.get(pair_ticker)
-                    if series2_orig is None or series2_norm is None: continue # Skip if pair data missing
-
-                    # 1. Calculate Overlap
-                    overlap_pct = calculate_overlap_percentage(series1_orig, series2_orig, full_data_range_length)
-
-                    # 2. Calculate Spread Volatility (Standard Deviation of Normalized Spread)
-                    spread_vol = np.nan
-                    common_norm_index = series1_norm.index.intersection(series2_norm.index)
-                    if not common_norm_index.empty:
-                        spread_norm = series1_norm.loc[common_norm_index] - series2_norm.loc[common_norm_index]
-                        if not spread_norm.empty:
-                            # Calculate Std Dev of the spread values directly, not returns
-                            spread_vol = calculate_volatility(spread_norm, use_returns=False, annualize=False) # Changed parameters
-
-                    # --- Add debugging output for each pair ---
-                    if DEBUG_MODE:
-                        debug_info = pair_info.copy() # Copy original pair info
-                        debug_info['overlap_%'] = f"{overlap_pct:.1f}"
-                        # Display the new spread_vol calculation
-                        debug_info['spread_std_dev'] = f"{spread_vol:.3f}" if pd.notna(spread_vol) else "NaN" # Renamed for clarity
-                        debug_info['passes_overlap'] = overlap_pct >= min_overlap_pct
-                        # Check against the new spread_vol calculation
-                        debug_info['passes_spread_std_dev'] = (volatility_range[0] <= spread_vol <= volatility_range[1]) if pd.notna(spread_vol) else False # Renamed for clarity
-                        # Use st.json for better readability of the dictionary
-                        st.json({instrument_names.get(pair_ticker, pair_ticker): debug_info})
-
-
-                    # Apply Filters
-                    if overlap_pct < min_overlap_pct: continue
+                # --- Add debugging output for each pair ---
+                if DEBUG_MODE:
+                    debug_info = pair_info.copy() # Copy original pair info
+                    debug_info['overlap_%'] = f"{overlap_pct:.1f}"
+                    # Display the new spread_vol calculation
+                    debug_info['spread_std_dev'] = f"{spread_vol:.3f}" if pd.notna(spread_vol) else "NaN" # Renamed for clarity
+                    debug_info['passes_overlap'] = overlap_pct >= min_overlap_pct
                     # Check against the new spread_vol calculation
-                    if not (volatility_range[0] <= spread_vol <= volatility_range[1]) and pd.notna(spread_vol): continue
-                    # Add sector filter here if implemented
-
-                    # Format and add to display list if filters passed
-                    pair_name = instrument_names[pair_ticker]
-                    metric_value = pair_info.get(metric_name)
-                    if metric_value is None or not np.isfinite(metric_value): continue
-
-                    try: metric_display = f"{metric_value:{metric_format}}"
-                    except (TypeError, ValueError): metric_display = str(metric_value)
-
-                    row_data = {
-                        "Paired Instrument": pair_name,
-                        metric_name.replace("_", " ").title(): metric_display,
-                        "Overlap (%)": f"{overlap_pct:.1f}",
-                        # Update column name in results table
-                        "Spread Std Dev": f"{spread_vol:.3f}" if pd.notna(spread_vol) else "N/A",
-                        "_ticker": pair_ticker # Internal lookup
-                    }
-
-                    # Add extra metric if exists
-                    if extra_metric_name and extra_metric_name in pair_info:
-                         extra_value = pair_info[extra_metric_name]
-                         extra_display_value = "N/A"
-                         if extra_value is not None:
-                             try:
-                                 if np.isinf(extra_value): extra_display_value = "inf"
-                                 else: extra_display_value = f"{extra_value:{extra_metric_format}}"
-                             except (TypeError, ValueError): extra_display_value = str(extra_value)
-                         row_data[extra_metric_name.replace("_", " ").title()] = extra_display_value
-
-                    filtered_display_data.append(row_data)
-                    pair_names_for_selection.append(pair_name) # Add only filtered pairs for visualization dropdown
-
-                    progress_filter.progress(min(1.0, (i + 1) / total_raw_pairs), text=f"Applying filters... ({i+1}/{total_raw_pairs})")
-                progress_filter.empty()
-
-                # --- Add debugging output footer ---
-                if DEBUG_MODE and raw_pairs_list:
-                    st.write("--- END DEBUG ---")
+                    debug_info['passes_spread_std_dev'] = (volatility_range[0] <= spread_vol <= volatility_range[1]) if pd.notna(spread_vol) else False # Renamed for clarity
+                    # Use st.json for better readability of the dictionary
+                    st.json({instrument_names.get(pair_ticker, pair_ticker): debug_info})
 
 
-            if filtered_display_data:
-                # Sort final filtered list based on the technique's primary metric
-                filtered_display_data = sorted(
-                    filtered_display_data,
-                    key=lambda x: float(x[metric_name.replace("_", " ").title()]) if x[metric_name.replace("_", " ").title()] not in ["N/A", "inf"] else (np.inf if sort_ascending else -np.inf),
-                    reverse=not sort_ascending
-                )
+                # Apply Filters
+                if overlap_pct < min_overlap_pct: continue
+                # Check against the new spread_vol calculation
+                if not (volatility_range[0] <= spread_vol <= volatility_range[1]) and pd.notna(spread_vol): continue
+                # Add sector filter here if implemented
 
-                results_df = pd.DataFrame(filtered_display_data)
+                # Format and add to display list if filters passed
+                pair_name = instrument_names[pair_ticker]
+                metric_value = pair_info.get(metric_name)
+                if metric_value is None or not np.isfinite(metric_value): continue
 
-                # Define column order dynamically
-                column_order = ["Paired Instrument"]
-                if metric_name: column_order.append(metric_name.replace("_", " ").title())
-                if extra_metric_name and extra_metric_name.replace("_", " ").title() in results_df.columns:
-                    column_order.append(extra_metric_name.replace("_", " ").title())
-                # Update column name in display order
-                column_order.extend(["Overlap (%)", "Spread Std Dev"]) # Add new filter columns
+                try: metric_display = f"{metric_value:{metric_format}}"
+                except (TypeError, ValueError): metric_display = str(metric_value)
 
-                existing_cols_in_order = [col for col in column_order if col in results_df.columns]
-                results_df_display = results_df[existing_cols_in_order + ["_ticker"]]
+                row_data = {
+                    "Paired Instrument": pair_name,
+                    metric_name.replace("_", " ").title(): metric_display,
+                    "Overlap (%)": f"{overlap_pct:.1f}",
+                    # Update column name in results table
+                    "Spread Std Dev": f"{spread_vol:.3f}" if pd.notna(spread_vol) else "N/A",
+                    "_ticker": pair_ticker # Internal lookup
+                }
 
-                st.dataframe(
-                    results_df_display.drop(columns=['_ticker']),
-                    use_container_width=True,
-                    hide_index=True
-                )
+                # Add extra metric if exists
+                if extra_metric_name and extra_metric_name in pair_info:
+                     extra_value = pair_info[extra_metric_name]
+                     extra_display_value = "N/A"
+                     if extra_value is not None:
+                         try:
+                             if np.isinf(extra_value): extra_display_value = "inf"
+                             else: extra_display_value = f"{extra_value:{extra_metric_format}}"
+                         except (TypeError, ValueError): extra_display_value = str(extra_value)
+                     row_data[extra_metric_name.replace("_", " ").title()] = extra_display_value
 
-                # --- Visualization (using filtered pairs) ---
-                st.divider()
-                st.header("📈 Pair Visualization")
-                if pair_names_for_selection: # Use names from the filtered list
-                    selected_pair_name_viz = st.selectbox("Select a Filtered Pair to Visualize:", pair_names_for_selection, key="viz_select_tab1")
+                filtered_display_data.append(row_data)
+                pair_names_for_selection.append(pair_name) # Add only filtered pairs for visualization dropdown
 
-                    selected_pair_ticker_viz = None
-                    if selected_pair_name_viz:
-                        matching_rows = results_df_display[results_df_display['Paired Instrument'] == selected_pair_name_viz]
-                        if not matching_rows.empty:
-                            selected_pair_ticker_viz = matching_rows['_ticker'].iloc[0]
+                progress_filter.progress(min(1.0, (i + 1) / total_raw_pairs), text=f"Applying filters... ({i+1}/{total_raw_pairs})")
+            progress_filter.empty()
 
-                    if selected_pair_ticker_viz and selected_ticker in price_data.columns and selected_pair_ticker_viz in price_data.columns:
-                        # --- Plotting logic (Normalized Prices and Spread) ---
-                        # (Use existing plotting code, ensuring it uses selected_ticker and selected_pair_ticker_viz)
-                        series1_plot = price_data[selected_ticker]
-                        series2_plot = price_data[selected_pair_ticker_viz]
-                        norm_series1_plot = normalize_prices(series1_plot) # Recalc for single series is fast
-                        norm_series2_plot = normalize_prices(series2_plot)
+            # --- Add debugging output footer ---
+            if DEBUG_MODE and raw_pairs_list:
+                st.write("--- END DEBUG ---")
 
-                        if not norm_series1_plot.empty and not norm_series2_plot.empty:
-                            # Plot Normalized Prices
-                            fig_norm = go.Figure()
-                            fig_norm.add_trace(go.Scatter(x=norm_series1_plot.index, y=norm_series1_plot, mode='lines', name=f"{selected_instrument_name} (Norm)", line=dict(color='blue')))
-                            fig_norm.add_trace(go.Scatter(x=norm_series2_plot.index, y=norm_series2_plot, mode='lines', name=f"{selected_pair_name_viz} (Norm)", line=dict(color='red')))
-                            fig_norm.update_layout(title=f"Normalized Price Comparison: {selected_instrument_name} vs {selected_pair_name_viz}",
-                                                xaxis_title="Date", yaxis_title="Normalized Price (Z-score)", legend_title="Instrument", hovermode="x unified")
-                            st.plotly_chart(fig_norm, use_container_width=True)
 
-                            # Plot Spread (Normalized Difference)
-                            common_plot_index = norm_series1_plot.index.intersection(norm_series2_plot.index)
-                            if not common_plot_index.empty:
-                                spread_plot = norm_series1_plot.loc[common_plot_index] - norm_series2_plot.loc[common_plot_index]
-                                if not spread_plot.empty:
-                                    fig_spread = go.Figure()
-                                    fig_spread.add_trace(go.Scatter(x=spread_plot.index, y=spread_plot, mode='lines', name='Spread (Normalized)', line=dict(color='green')))
-                                    spread_mean = spread_plot.mean()
-                                    if np.isfinite(spread_mean):
-                                         fig_spread.add_hline(y=spread_mean, line_dash="dash", line_color="grey", annotation_text=f"Mean: {spread_mean:.2f}")
-                                    fig_spread.update_layout(title=f"Spread (Normalized Difference): {selected_instrument_name} - {selected_pair_name_viz}",
-                                                            xaxis_title="Date", yaxis_title="Spread Value", hovermode="x unified")
-                                    st.plotly_chart(fig_spread, use_container_width=True)
-                                else: st.warning("⚠️ Could not plot spread (empty after calculation).")
-                            else: st.warning("⚠️ Could not plot spread due to lack of overlapping data.")
-                        else: st.warning("⚠️ Normalization failed for one or both selected series for plotting.")
-                    elif selected_pair_name_viz:
-                        st.warning(f"⚠️ Could not find data for the selected pair '{selected_pair_name_viz}' for plotting.")
-                else:
-                    st.info("✅ No pairs passed the filters for visualization.")
+        if filtered_display_data:
+            # Sort final filtered list based on the technique's primary metric
+            filtered_display_data = sorted(
+                filtered_display_data,
+                key=lambda x: float(x[metric_name.replace("_", " ").title()]) if x[metric_name.replace("_", " ").title()] not in ["N/A", "inf"] else (np.inf if sort_ascending else -np.inf),
+                reverse=not sort_ascending
+            )
+
+            results_df = pd.DataFrame(filtered_display_data)
+
+            # Define column order dynamically
+            column_order = ["Paired Instrument"]
+            if metric_name: column_order.append(metric_name.replace("_", " ").title())
+            if extra_metric_name and extra_metric_name.replace("_", " ").title() in results_df.columns:
+                column_order.append(extra_metric_name.replace("_", " ").title())
+            # Update column name in display order
+            column_order.extend(["Overlap (%)", "Spread Std Dev"]) # Add new filter columns
+
+            existing_cols_in_order = [col for col in column_order if col in results_df.columns]
+            results_df_display = results_df[existing_cols_in_order + ["_ticker"]]
+
+            st.dataframe(
+                results_df_display.drop(columns=['_ticker']),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # --- Visualization (using filtered pairs) ---
+            st.divider()
+            st.header("📈 Pair Visualization")
+            if pair_names_for_selection: # Use names from the filtered list
+                selected_pair_name_viz = st.selectbox("Select a Filtered Pair to Visualize:", pair_names_for_selection, key="viz_select_tab1")
+
+                selected_pair_ticker_viz = None
+                if selected_pair_name_viz:
+                    matching_rows = results_df_display[results_df_display['Paired Instrument'] == selected_pair_name_viz]
+                    if not matching_rows.empty:
+                        selected_pair_ticker_viz = matching_rows['_ticker'].iloc[0]
+
+                if selected_pair_ticker_viz and selected_ticker in price_data.columns and selected_pair_ticker_viz in price_data.columns:
+                    # --- Plotting logic (Normalized Prices and Spread) ---
+                    # (Use existing plotting code, ensuring it uses selected_ticker and selected_pair_ticker_viz)
+                    series1_plot = price_data[selected_ticker]
+                    series2_plot = price_data[selected_pair_ticker_viz]
+                    norm_series1_plot = normalize_prices(series1_plot) # Recalc for single series is fast
+                    norm_series2_plot = normalize_prices(series2_plot)
+
+                    if not norm_series1_plot.empty and not norm_series2_plot.empty:
+                        # Plot Normalized Prices
+                        fig_norm = go.Figure()
+                        fig_norm.add_trace(go.Scatter(x=norm_series1_plot.index, y=norm_series1_plot, mode='lines', name=f"{selected_instrument_name} (Norm)", line=dict(color='blue')))
+                        fig_norm.add_trace(go.Scatter(x=norm_series2_plot.index, y=norm_series2_plot, mode='lines', name=f"{selected_pair_name_viz} (Norm)", line=dict(color='red')))
+                        fig_norm.update_layout(title=f"Normalized Price Comparison: {selected_instrument_name} vs {selected_pair_name_viz}",
+                                            xaxis_title="Date", yaxis_title="Normalized Price (Z-score)", legend_title="Instrument", hovermode="x unified")
+                        st.plotly_chart(fig_norm, use_container_width=True)
+
+                        # Plot Spread (Normalized Difference)
+                        common_plot_index = norm_series1_plot.index.intersection(norm_series2_plot.index)
+                        if not common_plot_index.empty:
+                            spread_plot = norm_series1_plot.loc[common_plot_index] - norm_series2_plot.loc[common_plot_index]
+                            if not spread_plot.empty:
+                                fig_spread = go.Figure()
+                                fig_spread.add_trace(go.Scatter(x=spread_plot.index, y=spread_plot, mode='lines', name='Spread (Normalized)', line=dict(color='green')))
+                                spread_mean = spread_plot.mean()
+                                if np.isfinite(spread_mean):
+                                     fig_spread.add_hline(y=spread_mean, line_dash="dash", line_color="grey", annotation_text=f"Mean: {spread_mean:.2f}")
+                                fig_spread.update_layout(title=f"Spread (Normalized Difference): {selected_instrument_name} - {selected_pair_name_viz}",
+                                                        xaxis_title="Date", yaxis_title="Spread Value", hovermode="x unified")
+                                st.plotly_chart(fig_spread, use_container_width=True)
+                            else: st.warning("⚠️ Could not plot spread (empty after calculation).")
+                        else: st.warning("⚠️ Could not plot spread due to lack of overlapping data.")
+                    else: st.warning("⚠️ Normalization failed for one or both selected series for plotting.")
+                elif selected_pair_name_viz:
+                    st.warning(f"⚠️ Could not find data for the selected pair '{selected_pair_name_viz}' for plotting.")
             else:
-                 # Modify the message slightly to acknowledge filtering
-                 st.info("✅ No pairs found for {selected_instrument_name} using {selected_technique_single} *that passed the selected filters*.")
-                 # Add a note if debugging is off but raw pairs might exist
-                 if not DEBUG_MODE and selected_ticker in found_pairs_data and found_pairs_data[selected_ticker]:
-                     st.caption("Pairs might exist before filtering. Set DEBUG_MODE = True in the script to see pre-filter details.")
-
+                st.info("✅ No pairs passed the filters for visualization.")
         else:
-            # This message means the technique itself found nothing initially
-            st.info(f"✅ No pairs initially found for {selected_instrument_name} using {selected_technique_single} *before* applying any filters.")
-
+             # Modify the message slightly to acknowledge filtering
+             st.info("✅ No pairs found for {selected_instrument_name} using {selected_technique_single} *that passed the selected filters*.")
+             # Add a note if debugging is off but raw pairs might exist
+             if not DEBUG_MODE and selected_ticker in found_pairs_data and found_pairs_data[selected_ticker]:
+                 st.caption("Pairs might exist before filtering. Set DEBUG_MODE = True in the script to see pre-filter details.")
 
     with tab2:
         st.header(f"Technique Comparison for: {selected_instrument_name}")
@@ -1215,8 +1384,13 @@ if price_data is not None and not price_data.empty:
             st.warning("⚠️ Please select at least one technique in the sidebar for comparison.")
             st.stop()
 
+        # Display actual data range used
+        actual_start_date_comp = price_data.index.min().strftime('%Y-%m-%d')
+        actual_end_date_comp = price_data.index.max().strftime('%Y-%m-%d')
+
         st.write(f"Comparing techniques: {', '.join([t.split('(')[0].strip() for t in selected_techniques_multi])}")
-        st.write(f"Filters Applied: Min Overlap {min_overlap_pct}%, Spread Volatility Range {volatility_range[0]:.2f}-{volatility_range[1]:.2f}")
+        st.write(f"Data Range Analyzed: {actual_start_date_comp} to {actual_end_date_comp}") # Show actual range
+        st.write(f"Filters Applied: Min Overlap {min_overlap_pct}%, Spread Std Dev Range {volatility_range[0]:.2f}-{volatility_range[1]:.2f}") # Renamed filter
         st.divider()
 
         # Get series for the selected instrument once
@@ -1241,7 +1415,7 @@ if price_data is not None and not price_data.empty:
             start_calc_time_comp = time.time()
             try:
                 # --- (Similar try-except block as in tab1 to get raw pairs for 'technique') ---
-                if technique == TECHNIQUE_COINTEGRATION:
+                if technique ==                TECHNIQUE_COINTEGRATION:
                     calculation_function_comp = find_cointegrated_pairs
                     found_pairs_data_comp = calculation_function_comp(price_data, significance_level=coint_p_value_threshold)
                     metric_name_comp, metric_format_comp, sort_ascending_comp = "p_value", ".4f", True
@@ -1277,7 +1451,8 @@ if price_data is not None and not price_data.empty:
 
             end_calc_time_comp = time.time()
             if calculation_function_comp:
-                 st.caption(f"Calculation took {end_calc_time_comp - start_calc_time_comp:.2f}s (before filtering).")
+                 # Corrected typo in variable name below
+                 st.caption(f"Calculation took {end_calc_time_comp - start_calc_time_comp:.2f} seconds (before filtering).")
 
 
             # --- Filter results for this technique ---
@@ -1369,24 +1544,39 @@ if price_data is not None and not price_data.empty:
         st.subheader("🚀 Quickstart Guide")
         st.markdown("""
         1.  **Configure Sidebar:**
-            *   Select the **Date Range** for the analysis.
-            *   Choose the primary **Instrument** you want to find pairs for.
+            *   Select the **Data Source** ('Norgate Data' or 'Uploaded File').
+            *   If 'Uploaded File', use the **File Uploader** to select your CSV/XLSX file.
+            *   Select the **Date Range** for the analysis (data outside this range will be excluded).
+            *   Choose the primary **Instrument** you want to find pairs for (from Norgate or your file's columns).
             *   Select the **Analysis Technique(s)**:
                 *   For the "Pair Analysis" tab, choose one technique.
                 *   For the "Technique Comparison" tab, select multiple techniques.
             *   Adjust **Technique Parameters** (like p-value, correlation threshold, number of clusters) if applicable for the selected technique(s).
-            *   Set **Advanced Filters** like Minimum Data Overlap and Spread Volatility Range.
+            *   Set **Advanced Filters** like Minimum Data Overlap and Spread Std Dev Range.
         2.  **View Results:**
             *   Go to the **"Pair Analysis"** tab to see detailed results and visualizations for the single selected technique.
             *   Go to the **"Technique Comparison"** tab to see filtered results from multiple techniques side-by-side.
         3.  **Explore:** Use the visualizations and tables to understand the relationships between instruments based on the chosen methods and filters.
         """)
 
+        st.subheader("💾 Data Sources")
+        st.markdown("""
+        *   **Norgate Data:** Uses the `norgatedata` library to fetch historical futures data based on symbols defined in the `TICKER_MAP` within the `app.py` script and present in the specified Norgate watchlist (`DEFAULT_WATCHLIST`). Requires `norgatedata` library and Norgate Data subscription.
+        *   **Uploaded File:** Allows you to upload your own time series data in CSV or XLSX format.
+            *   **Expected Format:**
+                *   The **first column** must contain the dates or timestamps. These should be parsable by pandas (e.g., 'YYYY-MM-DD', 'MM/DD/YYYY HH:MM:SS').
+                *   **Subsequent columns** should contain the price data for each instrument.
+                *   The **header row** should contain the names of the instruments (these will be used for selection).
+                *   Data should be numeric. Non-numeric values will be treated as missing.
+            *   **Processing:** The app will attempt to parse dates, convert prices to numbers, forward-fill missing values, and align the data across all instruments.
+        """)
+
+
         st.subheader("⚙️ Methodology Overview")
         st.markdown("""
         This tool uses several methods to identify potential pairs.See the **Technique Comparison Guide** table below and the **sidebar expanders** for detailed descriptions, pros, cons, and use cases for each technique.
 
-        *   **Data Used:** Note whether a technique uses raw Prices, Normalized Prices, or Returns.
+        *   **Data Used:** Note whether a technique uses raw Prices, Normalize Prices, or Returns.
         *   **Filters:** The "Overlap (%)" filter ensures pairs have sufficient common data within the date range. The "Spread Volatility" filter assesses the stability of the difference between the normalized prices of the pair.
         """)
 
@@ -1410,10 +1600,17 @@ if price_data is not None and not price_data.empty:
 
         st.subheader("💡 Frequently Asked Questions (FAQ)")
         st.markdown("""
-        *   **Why are some symbols skipped?**
-            Symbols listed in your Norgate watchlist but *not* defined in the `TICKER_MAP` dictionary at the top of the `app.py` script will be ignored. Update the `TICKER_MAP` to include them. Also, symbols with insufficient or invalid data within the selected date range might be skipped during data fetching or processing. Warnings will usually appear in the app or console.
+        *   **Why are some Norgate symbols skipped?**
+            Symbols listed in your Norgate watchlist but *not* defined in the `TICKER_MAP` dictionary at the top of the `app.py` script will be ignored when using the 'Norgate Data' source. Update the `TICKER_MAP` to include them. Also, symbols with insufficient or invalid data within the selected date range might be skipped during data fetching or processing.
+        *   **Why did my file upload fail or result in no data?**
+            Check the **Data Sources** section above for the expected file format. Common issues include:
+                *   Incorrect file type (only CSV/XLSX supported).
+                *   Date/time information not in the first column or in an unreadable format.
+                *   Price data is non-numeric (e.g., contains text, currency symbols).
+                *   The file is empty or contains too many missing values that cannot be filled.
+                *   No data within the selected Start/End date range in the sidebar.
         *   **What does 'Half-Life' mean (Cointegration)?**
-            It estimates the time (in days, based on the data frequency) it takes for the spread between two cointegrated assets to revert halfway back to its long-term mean after a deviation. A shorter half-life suggests faster mean reversion. Infinite half-life means the calculated relationship is not mean-reverting based on the test.
+            It estimates the time (in periods, matching the input data frequency - likely days) it takes for the spread between two cointegrated assets to revert halfway back to its long-term mean after a deviation. A shorter half-life suggests faster mean reversion. Infinite half-life means the calculated relationship is not mean-reverting based on the test.
         *   **How to interpret P-value (Cointegration)?**
             The p-value indicates the probability of observing the data (or more extreme data) if the two series were *not* cointegrated. A low p-value (e.g., < 0.05) provides statistical evidence *against* the null hypothesis (no cointegration), suggesting the series *are* likely cointegrated.
         *   **What is Spread Std Dev (Normalized)?** # Updated FAQ item - Renamed from Spread Volatility
@@ -1515,11 +1712,14 @@ if price_data is not None and not price_data.empty:
 
 
 # --- Fallback messages if data loading failed earlier ---
-elif price_data is None and mapped_symbols:
-    # Only show error if mapped symbols existed but fetching failed
-    st.error("❌ Failed to fetch price data for mapped symbols. Check Norgate connection and symbol validity.")
-elif not mapped_symbols:
-     # Error already shown if no mapped symbols
+# (Modified slightly to account for data source selection)
+if data_source == "Norgate Data" and 'mapped_symbols' in locals() and not mapped_symbols:
+     # Error already shown if no mapped symbols for Norgate
      pass
-else: # Catchall for other cases where price_data might be empty
-    st.warning("⚠️ No price data available for the selected symbols and date range after processing.")
+elif data_source == "Uploaded File" and uploaded_file is None:
+     # Info message already shown about needing to upload
+     pass
+elif price_data is None: # General catch for other None cases
+    st.error("❌ Failed to load or process data. Check data source settings and file content.")
+elif price_data.empty: # General catch for empty dataframe after processing
+    st.warning("⚠️ No price data available for the selected source, symbols, and date range after processing.")
