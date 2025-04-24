@@ -286,15 +286,22 @@ def load_uploaded_data(uploaded_file, sheet_name=None): # Added sheet_name param
 
         # --- Data Preprocessing ---
         # Assume the first column is the date/time index
+        if df.columns.empty:
+             st.error(f"❌ Uploaded file ('{file_name}', Sheet: '{sheet_name}') has no columns.")
+             return pd.DataFrame(), []
         date_col = df.columns[0]
         df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
         df = df.set_index(date_col)
         df = df.sort_index() # Ensure chronological order
 
-        # Drop rows where the index is NaT (failed date parsing)
-        df = df.dropna(axis=0, how='all', subset=df.index.name, inplace=False)
+        # Drop rows where the index is NaT (failed date parsing) - Corrected method
+        original_rows_before_nat_drop = len(df)
+        df = df[pd.notna(df.index)]
+        if DEBUG_MODE:
+            st.caption(f"DEBUG: Rows before NaT index drop: {original_rows_before_nat_drop}, after: {len(df)}")
+
         if df.empty:
-            st.error(f"❌ No valid dates found in the first column ('{date_col}'). Please ensure it contains dates.")
+            st.error(f"❌ No valid dates found in the first column ('{date_col}') after parsing. Please ensure it contains dates.")
             return pd.DataFrame(), []
 
         # Convert remaining columns to numeric, coercing errors to NaN
@@ -348,16 +355,47 @@ def normalize_prices(price_df):
         st.error(f"❌ Error converting price data to numeric for normalization: {e}")
         return pd.DataFrame()
 
+    # --- Add Check for Zero Standard Deviation ---
+    if isinstance(price_df_float, pd.DataFrame):
+        zero_std_cols = price_df_float.columns[price_df_float.std() == 0].tolist()
+        if zero_std_cols:
+            st.warning(f"⚠️ Normalization Warning: The following columns have zero standard deviation within the selected date range and will likely result in NaN values after scaling: {', '.join(zero_std_cols)}")
+            if DEBUG_MODE:
+                 st.caption("This usually means all price values for these instruments are identical in the selected period.")
+    elif isinstance(price_df_float, pd.Series):
+         if price_df_float.std() == 0:
+              st.warning(f"⚠️ Normalization Warning: The series '{price_df_float.name}' has zero standard deviation and will likely result in NaN values after scaling.")
+              if DEBUG_MODE:
+                   st.caption("This usually means all price values are identical in the selected period.")
+    # --- End Check ---
+
+
     scaler = StandardScaler()
     # Handle both DataFrame and Series input
     if isinstance(price_df_float, pd.Series):
         # Reshape Series for scaler
-        norm_data = scaler.fit_transform(price_df_float.values.reshape(-1, 1))
+        # Check std dev again before scaling to avoid division by zero warning from scaler itself if possible
+        if price_df_float.std() == 0:
+             # Create a series of NaNs manually if std is zero
+             norm_data = np.full(price_df_float.shape, np.nan)
+        else:
+             norm_data = scaler.fit_transform(price_df_float.values.reshape(-1, 1))
         norm_df = pd.Series(norm_data.flatten(), index=price_df.index, name=price_df.name)
     elif isinstance(price_df_float, pd.DataFrame):
         # Check if DataFrame is empty after potential conversion errors
         if price_df_float.empty: return pd.DataFrame()
-        norm_data = scaler.fit_transform(price_df_float)
+        # Scale column by column to handle zero std dev gracefully
+        norm_data = {}
+        for col in price_df_float.columns:
+            series = price_df_float[col]
+            if series.std() == 0:
+                 # Create NaNs manually
+                 norm_data[col] = np.full(series.shape, np.nan)
+            else:
+                 # Scale normally
+                 norm_data[col] = scaler.fit_transform(series.values.reshape(-1, 1)).flatten()
+
+        # norm_data = scaler.fit_transform(price_df_float) # Original line
         norm_df = pd.DataFrame(norm_data, index=price_df.index, columns=price_df.columns)
     else:
         st.error("❌ Invalid data type passed to normalize_prices.")
@@ -974,19 +1012,51 @@ elif data_source == "Uploaded File":
         price_data, available_symbols = load_uploaded_data(uploaded_file, selected_sheet_name)
         # Filter data based on sidebar date range AFTER loading
         if not price_data.empty:
-            # Ensure index is datetime before filtering
-            price_data.index = pd.to_datetime(price_data.index)
-            start_datetime = pd.to_datetime(start_date_input)
-            end_datetime = pd.to_datetime(end_date_input)
+            if DEBUG_MODE:
+                st.write("--- DEBUG: Uploaded Data Info (Before Date Filter) ---")
+                buffer = io.StringIO()
+                price_data.info(buf=buffer)
+                st.text(buffer.getvalue())
+                st.dataframe(price_data.head())
 
-            # Filter based on date part of the index
-            price_data = price_data[
-                (price_data.index.normalize() >= start_datetime.normalize()) &
-                (price_data.index.normalize() <= end_datetime.normalize())
-            ]
+            # Ensure index is datetime before filtering
+            try: # Add try-except for robustness
+                price_data.index = pd.to_datetime(price_data.index)
+                start_datetime = pd.to_datetime(start_date_input)
+                end_datetime = pd.to_datetime(end_date_input)
+
+                # Filter based on date part of the index
+                original_rows = len(price_data)
+                price_data = price_data[
+                    (price_data.index.normalize() >= start_datetime.normalize()) &
+                    (price_data.index.normalize() <= end_datetime.normalize())
+                ]
+                filtered_rows = len(price_data)
+                if DEBUG_MODE:
+                    st.write(f"--- DEBUG: Date Filtering ---")
+                    st.caption(f"Original rows: {original_rows}, Filtered rows: {filtered_rows}")
+                    st.caption(f"Filtering range: {start_datetime.normalize().date()} to {end_datetime.normalize().date()}")
+                    if not price_data.empty:
+                        st.write("--- DEBUG: Uploaded Data Info (After Date Filter) ---")
+                        buffer = io.StringIO()
+                        price_data.info(buf=buffer)
+                        st.text(buffer.getvalue())
+                        st.dataframe(price_data.head())
+                    else:
+                        st.warning("DEBUG: price_data is empty after date filtering.")
+
+            except Exception as e:
+                 st.error(f"❌ Error during date conversion or filtering for uploaded data: {e}")
+                 price_data = pd.DataFrame() # Invalidate data on error
+
             # price_data = price_data[(price_data.index >= pd.to_datetime(start_date_input)) & (price_data.index <= pd.to_datetime(end_date_input))] # Original line kept for reference
             if price_data.empty:
-                 st.warning("⚠️ No data from the uploaded file falls within the selected Start/End date range.")
+                 # Make warning more specific if filtering caused emptiness
+                 if 'original_rows' in locals() and original_rows > 0: # Check if filtering happened
+                     st.warning(f"⚠️ No data from the uploaded file falls within the selected Start/End date range ({start_date_input} to {end_date_input}).")
+                 else:
+                     # This case should be handled by load_uploaded_data, but as a fallback:
+                     st.warning("⚠️ Uploaded data was empty even before date filtering.")
                  available_symbols = [] # Reset available symbols if date filter makes it empty
             else:
                  available_symbols = price_data.columns.tolist() # Update available symbols after date filtering
@@ -1109,7 +1179,7 @@ min_overlap_pct = st.sidebar.slider(
 )
 # Volatility of the SPREAD (normalized prices) - NOW Std Dev of Spread Values
 volatility_range = st.sidebar.slider(
-    "Spread Std Dev Range (Normalized)", 0.0, 3.0, (0.0, 1.0), 0.05, key="volatility_filter", # Adjusted range and label
+    "Spread Std Dev Range (Normalized)", 0.0, 3.0, (0.0, 2.5), 0.05, key="volatility_filter", # Adjusted range and label, Increased default max to 2.5
     help="Filter pairs based on the standard deviation of their normalized price spread (Z-score difference). Lower values suggest a more stable spread around its mean." # Adjusted help text
 )
 # Placeholder for Sector Filter (requires external data)
@@ -1324,55 +1394,140 @@ with tab1:
             # --- Visualization (using filtered pairs) ---
             st.divider()
             st.header("📈 Pair Visualization")
+            # --- Add Debug Check 1 ---
+            if DEBUG_MODE:
+                st.write(f"--- DEBUG: Visualization Entry ---")
+                st.caption(f"Number of filtered pairs available for selection: {len(pair_names_for_selection)}")
+                if not pair_names_for_selection:
+                    st.caption("No pairs passed filters, so no visualization dropdown will appear.")
+            # --- End Debug Check 1 ---
+
             if pair_names_for_selection: # Use names from the filtered list
                 selected_pair_name_viz = st.selectbox("Select a Filtered Pair to Visualize:", pair_names_for_selection, key="viz_select_tab1")
 
                 selected_pair_ticker_viz = None
                 if selected_pair_name_viz:
+                    # Find the corresponding ticker using the results_df_display which includes the '_ticker' column
                     matching_rows = results_df_display[results_df_display['Paired Instrument'] == selected_pair_name_viz]
                     if not matching_rows.empty:
                         selected_pair_ticker_viz = matching_rows['_ticker'].iloc[0]
+                    else:
+                         # Fallback: try finding ticker from name_to_ticker (should not be needed if results_df_display is correct)
+                         pair_name_to_ticker = {v: k for k, v in instrument_names.items()}
+                         selected_pair_ticker_viz = pair_name_to_ticker.get(selected_pair_name_viz)
 
-                if selected_pair_ticker_viz and selected_ticker in price_data.columns and selected_pair_ticker_viz in price_data.columns:
+                    # --- Add Debug Check 2 ---
+                    if DEBUG_MODE:
+                        st.write(f"--- DEBUG: Ticker Lookup ---")
+                        st.caption(f"Selected Pair Name for Viz: {selected_pair_name_viz}")
+                        st.caption(f"Looked up Pair Ticker for Viz: {selected_pair_ticker_viz}")
+                    # --- End Debug Check 2 ---
+
+
+                # Ensure selected_ticker and selected_pair_ticker_viz are valid and exist in price_data and norm_price_data
+                if selected_pair_ticker_viz and \
+                   selected_ticker in price_data.columns and \
+                   selected_pair_ticker_viz in price_data.columns and \
+                   selected_ticker in norm_price_data.columns and \
+                   selected_pair_ticker_viz in norm_price_data.columns:
+
                     # --- Plotting logic (Normalized Prices and Spread) ---
-                    # (Use existing plotting code, ensuring it uses selected_ticker and selected_pair_ticker_viz)
-                    series1_plot = price_data[selected_ticker]
-                    series2_plot = price_data[selected_pair_ticker_viz]
-                    norm_series1_plot = normalize_prices(series1_plot) # Recalc for single series is fast
-                    norm_series2_plot = normalize_prices(series2_plot)
+                    # Use pre-calculated normalized data
+                    norm_series1_plot = norm_price_data[selected_ticker]
+                    norm_series2_plot = norm_price_data[selected_pair_ticker_viz]
 
-                    if not norm_series1_plot.empty and not norm_series2_plot.empty:
-                        # Plot Normalized Prices
-                        fig_norm = go.Figure()
-                        fig_norm.add_trace(go.Scatter(x=norm_series1_plot.index, y=norm_series1_plot, mode='lines', name=f"{selected_instrument_name} (Norm)", line=dict(color='blue')))
-                        fig_norm.add_trace(go.Scatter(x=norm_series2_plot.index, y=norm_series2_plot, mode='lines', name=f"{selected_pair_name_viz} (Norm)", line=dict(color='red')))
-                        fig_norm.update_layout(title=f"Normalized Price Comparison: {selected_instrument_name} vs {selected_pair_name_viz}",
-                                            xaxis_title="Date", yaxis_title="Normalized Price (Z-score)", legend_title="Instrument", hovermode="x unified")
-                        st.plotly_chart(fig_norm, use_container_width=True)
+                    # --- Enhanced Debugging and Checks ---
+                    # Check if the normalized series are valid for plotting (not empty and containat least one non-NaN value)
+                    series1_valid = not norm_series1_plot.empty and norm_series1_plot.notna().any()
+                    series2_valid = not norm_series2_plot.empty and norm_series2_plot.notna().any()
 
-                        # Plot Spread (Normalized Difference)
-                        common_plot_index = norm_series1_plot.index.intersection(norm_series2_plot.index)
-                        if not common_plot_index.empty:
-                            spread_plot = norm_series1_plot.loc[common_plot_index] - norm_series2_plot.loc[common_plot_index]
-                            if not spread_plot.empty:
-                                fig_spread = go.Figure()
-                                fig_spread.add_trace(go.Scatter(x=spread_plot.index, y=spread_plot, mode='lines', name='Spread (Normalized)', line=dict(color='green')))
-                                spread_mean = spread_plot.mean()
-                                if np.isfinite(spread_mean):
-                                     fig_spread.add_hline(y=spread_mean, line_dash="dash", line_color="grey", annotation_text=f"Mean: {spread_mean:.2f}")
-                                fig_spread.update_layout(title=f"Spread (Normalized Difference): {selected_instrument_name} - {selected_pair_name_viz}",
-                                                        xaxis_title="Date", yaxis_title="Spread Value", hovermode="x unified")
-                                st.plotly_chart(fig_spread, use_container_width=True)
-                            else: st.warning("⚠️ Could not plot spread (empty after calculation).")
-                        else: st.warning("⚠️ Could not plot spread due to lack of overlapping data.")
-                    else: st.warning("⚠️ Normalization failed for one or both selected series for plotting.")
+                    if DEBUG_MODE:
+                        st.write(f"--- DEBUG: Pre-Plotting Checks ---")
+                        st.caption(f"Plotting: {selected_instrument_name} ({selected_ticker}) vs {selected_pair_name_viz} ({selected_pair_ticker_viz})")
+                        st.caption(f"Normalized Series 1 ({selected_ticker}) - Valid for Plotting: {series1_valid}")
+                        if not norm_series1_plot.empty:
+                            # Check for NaNs specifically
+                            nan_count1 = norm_series1_plot.isna().sum()
+                            st.text(norm_series1_plot.describe())
+                            st.caption(f"NaN count: {nan_count1} (out of {len(norm_series1_plot)})") # Show total count
+                        else:
+                            st.caption("Series 1 is empty.")
+
+                        st.caption(f"Normalized Series 2 ({selected_pair_ticker_viz}) - Valid for Plotting: {series2_valid}")
+                        if not norm_series2_plot.empty:
+                            # Check for NaNs specifically
+                            nan_count2 = norm_series2_plot.isna().sum()
+                            st.text(norm_series2_plot.describe())
+                            st.caption(f"NaN count: {nan_count2} (out of {len(norm_series2_plot)})") # Show total count
+                        else:
+                            st.caption("Series 2 is empty.")
+                        st.write("--- END DEBUG ---")
+
+                    if series1_valid and series2_valid: # Use the pre-calculated validity flags
+                        try: # --- Add Try-Except for Plotting ---
+                            # Plot Normalized Prices
+                            fig_norm = go.Figure()
+                            fig_norm.add_trace(go.Scatter(x=norm_series1_plot.index, y=norm_series1_plot, mode='lines', name=f"{selected_instrument_name} (Norm)", line=dict(color='blue')))
+                            fig_norm.add_trace(go.Scatter(x=norm_series2_plot.index, y=norm_series2_plot, mode='lines', name=f"{selected_pair_name_viz} (Norm)", line=dict(color='red')))
+                            fig_norm.update_layout(title=f"Normalized Price Comparison: {selected_instrument_name} vs {selected_pair_name_viz}",
+                                                xaxis_title="Date", yaxis_title="Normalized Price (Z-score)", legend_title="Instrument", hovermode="x unified")
+                            st.plotly_chart(fig_norm, use_container_width=True)
+
+                            # Plot Spread (Normalized Difference)
+                            spread_plot_df = pd.concat([norm_series1_plot, norm_series2_plot], axis=1, keys=['s1', 's2']).dropna()
+                            if not spread_plot_df.empty:
+                                spread_plot = spread_plot_df['s1'] - spread_plot_df['s2']
+                                if not spread_plot.empty:
+                                    fig_spread = go.Figure()
+                                    fig_spread.add_trace(go.Scatter(x=spread_plot.index, y=spread_plot, mode='lines',name='Spread (Normalized)', line=dict(color='green')))
+                                    spread_mean = spread_plot.mean()
+                                    if np.isfinite(spread_mean):
+                                         fig_spread.add_hline(y=spread_mean, line_dash="dash", line_color="grey", annotation_text=f"Mean: {spread_mean:.2f}")
+                                    fig_spread.update_layout(title=f"Spread (Normalized Difference): {selected_instrument_name} - {selected_pair_name_viz}",
+                                                            xaxis_title="Date", yaxis_title="Spread Value", hovermode="x unified")
+                                    st.plotly_chart(fig_spread, use_container_width=True)
+                                else: st.warning("⚠️ Could not plot spread (empty after calculation).")
+                            else: st.warning("⚠️ Could not plot spread due to lack of overlapping data between normalized series.")
+                        except Exception as plot_err: # --- Catch Plotting Errors ---
+                             st.error(f"❌ An error occurred during plotting: {plot_err}")
+                             st.error(traceback.format_exc())
+                             if DEBUG_MODE:
+                                 st.write("--- DEBUG: Data at Plotting Error ---")
+                                 st.caption("Series 1 (Normalized):")
+                                 st.dataframe(norm_series1_plot.head())
+                                 st.caption("Series 2 (Normalized):")
+                                 st.dataframe(norm_series2_plot.head())
+                                 if 'spread_plot' in locals():
+                                     st.caption("Spread Series:")
+                                     st.dataframe(spread_plot.head())
+                    else: # Provide more specific feedback
+                        warning_msg = "⚠️ Cannot plot: "
+                        if not series1_valid and not series2_valid:
+                            warning_msg += f"Normalized data for *both* {selected_instrument_name} and {selected_pair_name_viz} is invalid (empty or all NaN)."
+                        elif not series1_valid:
+                            warning_msg += f"Normalized data for {selected_instrument_name} ({selected_ticker}) is invalid (empty or all NaN)."
+                        elif not series2_valid:
+                             warning_msg += f"Normalized data for {selected_pair_name_viz} ({selected_pair_ticker_viz}) is invalid (empty or all NaN)."
+                        st.warning(warning_msg)
+                        if not DEBUG_MODE:
+                             st.caption("Enable DEBUG_MODE in the script for more details.")
+
                 elif selected_pair_name_viz:
-                    st.warning(f"⚠️ Could not find data for the selected pair '{selected_pair_name_viz}' for plotting.")
+                    # Add more specific warnings if tickers were found but data is missing or invalid
+                    if not selected_pair_ticker_viz:
+                         st.warning(f"⚠️ Could not find the ticker for the selected pair name '{selected_pair_name_viz}' for plotting.")
+                    elif selected_ticker not in price_data.columns or selected_ticker not in norm_price_data.columns:
+                         st.warning(f"⚠️ Data missing for the primary instrument '{selected_instrument_name}' ({selected_ticker}) in price_data or norm_price_data.")
+                    elif selected_pair_ticker_viz not in price_data.columns or selected_pair_ticker_viz not in norm_price_data.columns:
+                         st.warning(f"⚠️ Data missing for the selected pair instrument '{selected_pair_name_viz}' ({selected_pair_ticker_viz}) in price_data or norm_price_data.")
+                    else:
+                         st.warning(f"⚠️ Could not find valid data for the selected pair '{selected_pair_name_viz}' for plotting (check data availability and normalization results).")
+
             else:
                 st.info("✅ No pairs passed the filters for visualization.")
         else:
              # Modify the message slightly to acknowledge filtering
-             st.info("✅ No pairs found for {selected_instrument_name} using {selected_technique_single} *that passed the selected filters*.")
+             st.info(f"✅ No pairs found for {selected_instrument_name} using {selected_technique_single} *that passed the selected filters*.")
              # Add a note if debugging is off but raw pairs might exist
              if not DEBUG_MODE and selected_ticker in found_pairs_data and found_pairs_data[selected_ticker]:
                  st.caption("Pairs might exist before filtering. Set DEBUG_MODE = True in the script to see pre-filter details.")
@@ -1402,6 +1557,7 @@ with tab1:
              st.stop()
 
         # --- Run selected techniques and filter results ---
+
         all_results_filtered = {}
 
         for technique in selected_techniques_multi:
@@ -1560,7 +1716,7 @@ with tab1:
         """)
 
         st.subheader("💾 Data Sources")
-        st.markdown("""
+        st.markdown("""        
         *   **Norgate Data:** Uses the `norgatedata` library to fetch historical futures data based on symbols defined in the `TICKER_MAP` within the `app.py` script and present in the specified Norgate watchlist (`DEFAULT_WATCHLIST`). Requires `norgatedata` library and Norgate Data subscription.
         *   **Uploaded File:** Allows you to upload your own time series data in CSV or XLSX format.
             *   **Expected Format:**
@@ -1571,12 +1727,12 @@ with tab1:
             *   **Processing:** The app will attempt to parse dates, convert prices to numbers, forward-fill missing values, and align the data across all instruments.
         """)
 
-
         st.subheader("⚙️ Methodology Overview")
-        st.markdown("""
+        st.markdown("""        
         This tool uses several methods to identify potential pairs.See the **Technique Comparison Guide** table below and the **sidebar expanders** for detailed descriptions, pros, cons, and use cases for each technique.
 
         *   **Data Used:** Note whether a technique uses raw Prices, Normalize Prices, or Returns.
+        *   **Handles Non-Stationary Prices?:** Indicates if the technique can be applied directly to non-stationary price series.
         *   **Filters:** The "Overlap (%)" filter ensures pairs have sufficient common data within the date range. The "Spread Volatility" filter assesses the stability of the difference between the normalized prices of the pair.
         """)
 
@@ -1599,13 +1755,13 @@ with tab1:
 
 
         st.subheader("💡 Frequently Asked Questions (FAQ)")
-        st.markdown("""
+        st.markdown("""        
         *   **Why are some Norgate symbols skipped?**
             Symbols listed in your Norgate watchlist but *not* defined in the `TICKER_MAP` dictionary at the top of the `app.py` script will be ignored when using the 'Norgate Data' source. Update the `TICKER_MAP` to include them. Also, symbols with insufficient or invalid data within the selected date range might be skipped during data fetching or processing.
         *   **Why did my file upload fail or result in no data?**
             Check the **Data Sources** section above for the expected file format. Common issues include:
                 *   Incorrect file type (only CSV/XLSX supported).
-                *   Date/time information not in the first column or in an unreadable format.
+                *   Date data not in the first column or in an unreadable format.
                 *   Price data is non-numeric (e.g., contains text, currency symbols).
                 *   The file is empty or contains too many missing values that cannot be filled.
                 *   No data within the selected Start/End date range in the sidebar.
@@ -1723,3 +1879,4 @@ elif price_data is None: # General catch for other None cases
     st.error("❌ Failed to load or process data. Check data source settings and file content.")
 elif price_data.empty: # General catch for empty dataframe after processing
     st.warning("⚠️ No price data available for the selected source, symbols, and date range after processing.")
+
