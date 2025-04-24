@@ -1470,7 +1470,14 @@ with tab1:
                             fig_norm.add_trace(go.Scatter(x=norm_series1_plot.index, y=norm_series1_plot, mode='lines', name=f"{selected_instrument_name} (Norm)", line=dict(color='blue')))
                             fig_norm.add_trace(go.Scatter(x=norm_series2_plot.index, y=norm_series2_plot, mode='lines', name=f"{selected_pair_name_viz} (Norm)", line=dict(color='red')))
                             fig_norm.update_layout(title=f"Normalized Price Comparison: {selected_instrument_name} vs {selected_pair_name_viz}",
-                                                xaxis_title="Date", yaxis_title="Normalized Price (Z-score)", legend_title="Instrument", hovermode="x unified")
+                                                xaxis_title="Date", yaxis_title="Normalized Price (Z-score)", legend_title="Instrument", hovermode="x unified",
+                                                legend=dict(
+                                                    orientation="h",
+                                                    yanchor="bottom",
+                                                    y=1.02,
+                                                    xanchor="right",
+                                                    x=1
+                                                ))
                             st.plotly_chart(fig_norm, use_container_width=True)
 
                             # Plot Spread (Normalized Difference)
