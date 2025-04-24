@@ -8,7 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
-.roo
 uv.lock
 .roomodes
 Futures.xlsx

@@ -1,9 +1,0 @@
-streamlit
-pandas
-numpy
-plotly
-statsmodels
-scikit-learn
-dtaidistance[numpy] # Include numpy extra for potential C optimizations
-norgatedata # Requires separate installation and license from Norgate
-streamlit-agraph
