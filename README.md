@@ -105,7 +105,6 @@ This application demonstrates proficiency in data analysis, application developm
 
 ## Potential Future Improvements
 
-*   Integration with a backtesting framework (e.g., `backtrader`, `zipline-reloaded`) to evaluate strategy performance.
 *   Addition of more advanced statistical tests or machine learning models (e.g., Kalman Filters, VECM).
 *   Real-time data processing capabilities.
 *   Deployment to a cloud platform (e.g., Streamlit Community Cloud, Heroku, AWS).
