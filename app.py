@@ -290,7 +290,8 @@ def load_uploaded_data(uploaded_file, sheet_name=None): # Added sheet_name param
              st.error(f"❌ Uploaded file ('{file_name}', Sheet: '{sheet_name}') has no columns.")
              return pd.DataFrame(), []
         date_col = df.columns[0]
-        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        # Add infer_datetime_format=True for potential speedup and warning suppression
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce', infer_datetime_format=True)
         df = df.set_index(date_col)
         df = df.sort_index() # Ensure chronological order
 
@@ -368,7 +369,6 @@ def normalize_prices(price_df):
               if DEBUG_MODE:
                    st.caption("This usually means all price values are identical in the selected period.")
     # --- End Check ---
-
 
     scaler = StandardScaler()
     # Handle both DataFrame and Series input
