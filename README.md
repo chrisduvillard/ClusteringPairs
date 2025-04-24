@@ -65,24 +65,28 @@ This application demonstrates proficiency in data analysis, application developm
 
 2.  **Clone the Repository:**
     ```bash
-    git clone <your-repository-url> # Replace with your repo URL
+    git clone https://github.com/chrisduvillard/ClusteringPairs.git
     cd ClusteringPairs
     ```
 
-3.  **Create and Activate Virtual Environment (Recommended):**
+3.  **Create and Activate Virtual Environment (using uv):**
+    *   First, install `uv` if you haven't already: [https://github.com/astral-sh/uv#installation](https://github.com/astral-sh/uv#installation)
+    *   Then, create and activate the environment:
     ```bash
-    python -m venv venv
-    # Windows
-    .\venv\Scripts\activate
+    uv venv
+    # Windows (Powershell)
+    .venv\Scripts\Activate.ps1
+    # Windows (CMD)
+    .venv\Scripts\activate.bat
     # macOS/Linux
-    source venv/bin/activate
+    source .venv/bin/activate
     ```
 
-4.  **Install Dependencies:**
+4.  **Install Dependencies (using uv and pyproject.toml):**
     ```bash
-    pip install -r requirements.txt
+    uv pip install -p .
     ```
-    *(Ensure `norgatedata` is installed and licensed separately)*
+    *(This command reads dependencies from `pyproject.toml`. Ensure `norgatedata` is listed there or installed and licensed separately)*
 
 5.  **Configure `app.py`:**
     *   Open `app.py`.
