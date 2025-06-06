@@ -28,7 +28,7 @@ This application demonstrates proficiency in data analysis, application developm
 *   **Interactive Streamlit UI:**
     *   Intuitive controls for date range selection, instrument choice, and technique configuration.
     *   Adjustable parameters for fine-tuning analysis (e.g., p-value, correlation threshold).
-*   **Advanced Filtering:** Refine results based on data overlap and spread characteristics.
+*   **Advanced Filtering:** Refine results based on a configurable lookback window, data overlap, and spread characteristics.
 *   **Clear Visualizations:** Interactive Plotly charts for normalized prices and pair spreads.
 *   **Technique Comparison:** Side-by-side comparison of results from different methods.
 *   **In-App Documentation:** Explanations, pros/cons, and use cases for each technique.

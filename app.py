@@ -346,71 +346,59 @@ def calculate_returns(price_df):
     return returns.dropna(axis=0, how='all')
 
 @st.cache_data
-def normalize_prices(price_df):
-    """Normalizes price data using Z-score (StandardScaler)."""
+def normalize_prices(price_df, min_periods=30):
+    """
+    Normalizes price data using a point-in-time (expanding window) Z-score to avoid lookahead bias.
+    For each point 't', the Z-score is calculated using the mean and std dev of all data up to 't-1'.
+    """
     if price_df is None or price_df.empty: return pd.DataFrame()
-    # Ensure data is float before scaling
     try:
         price_df_float = price_df.astype(float)
     except ValueError as e:
         st.error(f"❌ Error converting price data to numeric for normalization: {e}")
         return pd.DataFrame()
 
-    # --- Add Check for Zero Standard Deviation ---
-    if isinstance(price_df_float, pd.DataFrame):
+    # Calculate expanding mean and std dev. These are series of means/stds over time.
+    # min_periods ensures we have enough data to calculate a meaningful std dev.
+    expanding_mean = price_df_float.expanding(min_periods=min_periods).mean()
+    expanding_std = price_df_float.expanding(min_periods=min_periods).std()
+
+    # Shift the stats by 1 to ensure that for any time 't', we only use data up to 't-1'.
+    # This is the key to preventing lookahead bias.
+    mean_for_norm = expanding_mean.shift(1)
+    std_for_norm = expanding_std.shift(1)
+
+    # Handle cases where std dev is zero to avoid division by zero.
+    # Replace 0 with NaN, so the result of division will be NaN, not inf.
+    std_for_norm[std_for_norm == 0] = np.nan
+
+    # Calculate the point-in-time Z-score.
+    norm_df = (price_df_float - mean_for_norm) / std_for_norm
+
+    # The first (min_periods - 1) rows + 1 shifted row will be NaN.
+    # This is expected as we need a minimum amount of data to normalize.
+    # Downstream functions will need to handle these NaNs, likely by dropping them.
+    if (price_df_float.std() == 0).any():
         zero_std_cols = price_df_float.columns[price_df_float.std() == 0].tolist()
-        if zero_std_cols:
-            st.warning(f"⚠️ Normalization Warning: The following columns have zero standard deviation within the selected date range and will likely result in NaN values after scaling: {', '.join(zero_std_cols)}")
-            if DEBUG_MODE:
-                 st.caption("This usually means all price values for these instruments are identical in the selected period.")
-    elif isinstance(price_df_float, pd.Series):
-         if price_df_float.std() == 0:
-              st.warning(f"⚠️ Normalization Warning: The series '{price_df_float.name}' has zero standard deviation and will likely result in NaN values after scaling.")
-              if DEBUG_MODE:
-                   st.caption("This usually means all price values are identical in the selected period.")
-    # --- End Check ---
-
-    scaler = StandardScaler()
-    # Handle both DataFrame and Series input
-    if isinstance(price_df_float, pd.Series):
-        # Reshape Series for scaler
-        # Check std dev again before scaling to avoid division by zero warning from scaler itself if possible
-        if price_df_float.std() == 0:
-             # Create a series of NaNs manually if std is zero
-             norm_data = np.full(price_df_float.shape, np.nan)
-        else:
-             norm_data = scaler.fit_transform(price_df_float.values.reshape(-1, 1))
-        norm_df = pd.Series(norm_data.flatten(), index=price_df.index, name=price_df.name)
-    elif isinstance(price_df_float, pd.DataFrame):
-        # Check if DataFrame is empty after potential conversion errors
-        if price_df_float.empty: return pd.DataFrame()
-        # Scale column by column to handle zero std dev gracefully
-        norm_data = {}
-        for col in price_df_float.columns:
-            series = price_df_float[col]
-            if series.std() == 0:
-                 # Create NaNs manually
-                 norm_data[col] = np.full(series.shape, np.nan)
-            else:
-                 # Scale normally
-                 norm_data[col] = scaler.fit_transform(series.values.reshape(-1, 1)).flatten()
-
-        # norm_data = scaler.fit_transform(price_df_float) # Original line
-        norm_df = pd.DataFrame(norm_data, index=price_df.index, columns=price_df.columns)
-    else:
-        st.error("❌ Invalid data type passed to normalize_prices.")
-        return pd.DataFrame()
+        st.warning(f"⚠️ Normalization Warning: The following columns have zero standard deviation for the *entire* period and will be all NaN after normalization: {', '.join(zero_std_cols)}")
 
     return norm_df
 
 @st.cache_data
-def calculate_volatility(series, annualize=True, use_returns=True):
+def calculate_volatility(series, annualize=True, use_returns=True, window=None):
     """
     Calculates volatility.
     If use_returns=True, calculates std dev of percentage returns (annualized if specified).
-    If use_returns=False, calculates std dev of the series values directly (annualization ignored).
+    If use_returns=False, calculates std dev of the series values directly.
+    If a 'window' is provided, the calculation is performed on the last 'window' of data to avoid lookahead bias.
     """
     if series is None or series.empty or len(series) < 2: return np.nan
+
+    # If a window is specified, use the tail of the series
+    if window is not None and len(series) >= window:
+        series = series.iloc[-window:]
+    elif window is not None and len(series) < window:
+        return np.nan # Not enough data for the window
 
     if use_returns:
         returns = series.pct_change().dropna()
@@ -422,9 +410,6 @@ def calculate_volatility(series, annualize=True, use_returns=True):
     else:
         # Calculate std dev of the series values directly
         vol = series.std()
-        # Annualization doesn't apply in the same way to std dev of levels
-        # if annualize: # Optional: could add logic if needed, but likely not for spread std dev
-        #     pass
 
     return vol
 
@@ -437,39 +422,56 @@ def calculate_overlap_percentage(_series1, _series2, _full_range_length):
 
 
 @st.cache_data
-def calculate_half_life(series):
-    """Calculates the half-life of mean reversion for a time series using OLS."""
+def calculate_half_life(series, window=120, min_obs_pct=0.8):
+    """
+    Calculates the half-life of mean reversion using a rolling OLS regression to avoid lookahead bias.
+    Returns the half-life based on the statistics from the final window period.
+    """
     try:
         series = series.dropna()
-        # Need at least a few points for regression
-        if len(series) < 10: return np.inf
-        # Calculate lagged series and delta
-        lagged_series = series.shift(1).dropna()
-        # Align series with lagged series
-        aligned_series = series.loc[lagged_series.index]
-        # Ensure enough points remain after alignment
-        if len(aligned_series) < 10: return np.inf
-        delta = aligned_series - lagged_series
-        # Add constant for intercept term in OLS
-        X = sm.add_constant(lagged_series)
-        # Fit OLS model: delta = intercept + lambda * lagged_series + error
-        model = sm.OLS(delta, X)
-        results = model.fit()
-        # Check if lambda (coefficient of lagged_series) exists and is valid
-        if len(results.params) < 2 or not np.isfinite(results.params.iloc[1]): return np.inf
-        lambda_ = results.params.iloc[1] # Coefficient for lagged series
-        # Half-life requires lambda < 0 (mean reversion)
-        if lambda_ >= 0: return np.inf
+        min_obs = max(10, int(window * min_obs_pct))
+        # Need at least enough points for one window calculation
+        if len(series) < window:
+            return np.inf
+
+        # Prepare lagged and delta series for regression
+        lagged_series = series.shift(1)
+        delta = series - lagged_series
+        # Combine into a DataFrame and drop NaNs from lagging/differencing
+        df = pd.DataFrame({'delta': delta, 'lagged': lagged_series}).dropna()
+
+        if len(df) < min_obs:
+            return np.inf
+
+        # Add a constant for the intercept term in the regression
+        X = sm.add_constant(df['lagged'])
+
+        # Use RollingOLS for efficient rolling regression
+        # This calculates the regression for each window, but we only need the last one
+        # to represent the most recent half-life estimate without lookahead.
+        rols = sm.RollingOLS(endog=df['delta'], exog=X, window=window, min_nobs=min_obs)
+        rres = rols.fit()
+        lambdas = rres.params['lagged']
+
+        # Get the lambda from the last valid window
+        if lambdas.empty or not np.isfinite(lambdas.iloc[-1]):
+            return np.inf
+
+        last_lambda = lambdas.iloc[-1]
+
+        # Half-life is meaningful only for mean-reverting series (lambda < 0)
+        if last_lambda >= 0:
+            return np.inf
+
         # Calculate half-life: -ln(2) / lambda
-        half_life = -np.log(2) / lambda_
-        # Return half-life only if it's finite
+        half_life = -np.log(2) / last_lambda
         return half_life if np.isfinite(half_life) else np.inf
-    except (ValueError, np.linalg.LinAlgError, IndexError):
-        # Catch potential errors during regression or indexing
+
+    except (ValueError, np.linalg.LinAlgError, IndexError, KeyError):
+        # Catch potential errors during regression, indexing, or if 'lagged' param is missing
         return np.inf
     except Exception:
         # Catch any other unexpected errors
-        # st.warning(f"⚠️ Unexpected error calculating half-life: {e}") # Optional: log if needed
         return np.inf
 
 # --- Pair Finding Techniques ---
@@ -477,7 +479,7 @@ def calculate_half_life(series):
 # Overlap and Volatility will be calculated later for filtering.
 
 @st.cache_data
-def find_cointegrated_pairs(_price_df, significance_level=0.05):
+def find_cointegrated_pairs(_price_df, significance_level=0.05, lookback_window=120):
     """Finds cointegrated pairs using Engle-Granger test and calculates half-life."""
     if _price_df is None or _price_df.empty or _price_df.shape[1] < 2: return {}
     # Normalize prices for spread calculation later (more stable half-life)
@@ -523,7 +525,8 @@ def find_cointegrated_pairs(_price_df, significance_level=0.05):
                         # Simple spread (can be refined with hedge ratio if needed)
                         spread = norm_series1_aligned - norm_series2_aligned
                         if not spread.empty:
-                            half_life = calculate_half_life(spread)
+                            # Use a configurable window for half-life calculation to avoid lookahead bias
+                            half_life = calculate_half_life(spread, window=lookback_window)
 
                     # Store only essential info initially
                     pair_info = {'pair_with': ticker2, 'p_value': pvalue, 'score': score, 'half_life': half_life}
@@ -650,13 +653,22 @@ def find_cluster_pairs(_price_df, num_clusters):
     """Finds pairs by clustering instruments (K-Means) based on normalized prices, then ranks pairs within clusters using SSD."""
     if _price_df is None or _price_df.empty or _price_df.shape[1] < 2 or num_clusters <= 1:
         return {}
+    # Normalization now uses an expanding window, which introduces NaNs at the start.
+    # We must drop these rows before clustering to ensure all instruments are compared over the same, valid time period.
     norm_df = normalize_prices(_price_df)
     if norm_df.empty:
         st.warning("⚠️ Price data became empty after normalization in clustering.")
         return {}
 
+    # Drop rows with any any NaNs to get a clean, aligned dataset for clustering
+    norm_df_cleaned = norm_df.dropna(axis=0, how='any')
+
+    if norm_df_cleaned.empty:
+        st.warning("⚠️ Not enough data for clustering after removing NaNs from normalization. Try a longer date range.")
+        return {}
+
     # K-Means expects features (time points) as columns, samples (instruments) as rows
-    data_for_clustering = norm_df.transpose().fillna(0) # Fill NaNs just in case, though dropna in fetch should handle most
+    data_for_clustering = norm_df_cleaned.transpose()
     if data_for_clustering.empty or data_for_clustering.shape[0] <= num_clusters:
         st.warning("⚠️ Not enough instruments or data for clustering after processing.")
         return {}
@@ -700,8 +712,8 @@ def find_cluster_pairs(_price_df, num_clusters):
             if ticker1 == ticker2: continue # Skip self-comparison
 
             try:
-                # Calculate SSD between ticker1 and ticker2 using the normalized data
-                series1, series2 = norm_df[ticker1].dropna(), norm_df[ticker2].dropna()
+                # Calculate SSD between ticker1 and ticker2 using the cleaned normalized data
+                series1, series2 = norm_df_cleaned[ticker1].dropna(), norm_df_cleaned[ticker2].dropna()
                 common_index = series1.index.intersection(series2.index)
 
                 if len(common_index) < min_obs_ssd: continue
@@ -740,12 +752,13 @@ def find_dtw_pairs(_price_df):
     pairs = {}
     tickers = norm_df.columns
     processed_pairs = set()
-    progress_bar = st.progress(0, text="Finding similar pairs (DTW - Optimized)...")
+    progress_bar = st.progress(0, text="Finding similar pairs (DTW)...")
     total_checks = max(1, (n * (n - 1)) // 2)
     checks_done = 0
     start_time = time.time()
     use_c_dtw = True # Assume C is available, will fallback if error
     min_len = 10 # Minimum length for DTW calculation
+    c_warning_shown = False # Track if we've shown the C library warning
 
     # Precompute numpy arrays for speed, ensuring they are C-contiguous double
     norm_arrays = {}
@@ -770,34 +783,30 @@ def find_dtw_pairs(_price_df):
                 # Skip if either series was too short or failed normalization
                 if series1 is None or series2 is None: continue
 
-                # --- Use Fast DTW with Pruning (dtaidistance) ---
+                # --- Use DTW with proper fallback handling ---
                 dtw_distance = np.inf # Default to infinity
-                try:
-                    # Try using the C implementation first with pruning for speed
-                    # window: limits max shift (e.g., 10% of length) - adjust if needed
-                    # max_dist: stop early if distance exceeds this (optional)
-                    window_size = max(10, int(0.1 * max(len(series1), len(series2)))) # Example: 10% window
-                    dtw_distance = dtw.distance_fast(series1, series2, window=window_size, use_pruning=True)
-                except ImportError:
-                     if use_c_dtw: # Show warning only once per run
-                         st.warning(f"⚠️ `dtaidistance` C library optimization not available, using slower Python DTW. Install C library (`pip install dtaidistance[numpy]`) for speed.")
-                         use_c_dtw = False
-                     try:
-                         # Pure Python version (slower)
-                         dtw_distance = dtw.distance(series1, series2)
-                     except Exception as py_err:
-                          st.warning(f"⚠️ Python DTW calculation also failed for {get_instrument_name(ticker1,TICKER_MAP)} & {get_instrument_name(ticker2,TICKER_MAP)}: {py_err}")
-                except Exception as c_err:
-                    # Fallback to pure python if C fails for other reasons
-                    if use_c_dtw: # Show warning only once per run
-                         st.warning(f"⚠️ `dtaidistance` C library optimization failed ({c_err}), using slower Python DTW.")
-                         use_c_dtw = False
+                
+                # Try fast DTW first if C library is available
+                if use_c_dtw:
                     try:
-                        # Pure Python version (slower)
+                        # Try using the fast C implementation with pruning for speed
+                        window_size = max(10, int(0.1 * max(len(series1), len(series2))))
+                        dtw_distance = dtw.distance_fast(series1, series2, window=window_size, use_pruning=True)
+                    except Exception as c_err:
+                        # C library failed, switch to Python implementation
+                        if not c_warning_shown:
+                            st.warning(f"⚠️ dtaidistance C library optimization failed ({str(c_err)[:100]}...), using slower Python DTW.")
+                            c_warning_shown = True
+                        use_c_dtw = False
+                
+                # Use Python implementation if C failed or not available
+                if not use_c_dtw or not np.isfinite(dtw_distance):
+                    try:
+                        # Pure Python version (slower but more reliable)
                         dtw_distance = dtw.distance(series1, series2)
                     except Exception as py_err:
-                         st.warning(f"⚠️ Python DTW calculation also failed for {get_instrument_name(ticker1,TICKER_MAP)} & {get_instrument_name(ticker2,TICKER_MAP)}: {py_err}")
-
+                        st.warning(f"⚠️ Python DTW calculation failed for {get_instrument_name(ticker1,TICKER_MAP)} & {get_instrument_name(ticker2,TICKER_MAP)}: {py_err}")
+                        continue
 
                 # Add pair if DTW distance is finite
                 if np.isfinite(dtw_distance):
@@ -814,13 +823,15 @@ def find_dtw_pairs(_price_df):
                  st.warning(f"⚠️ Unexpected error during DTW calculation for {get_instrument_name(ticker1,TICKER_MAP)} & {get_instrument_name(ticker2,TICKER_MAP)}: {e}")
 
             checks_done += 1
-            # --- Update progress bar more frequently ---
+            # Update progress bar more frequently
             if checks_done % 10 == 0 or checks_done == total_checks:
                  progress_bar.progress(min(1.0, checks_done / total_checks), text=f"Finding similar pairs (DTW)... ({checks_done}/{total_checks})")
 
     progress_bar.empty()
     end_time = time.time()
-    st.info(f"ℹ️ DTW calculation took {end_time - start_time:.2f} seconds.")
+    dtw_method = "C library (fast)" if use_c_dtw else "Python (slower)"
+    st.info(f"ℹ️ DTW calculation using {dtw_method} took {end_time - start_time:.2f} seconds.")
+    
     # Sort pairs by DTW distance (ascending)
     for ticker in pairs:
         pairs[ticker] = sorted(pairs[ticker], key=lambda x: x['dtw_distance'])
@@ -1173,6 +1184,10 @@ else:
 
 # --- Advanced Filtering Controls ---
 st.sidebar.subheader("🔍 Advanced Filters")
+lookback_window = st.sidebar.slider(
+    "Lookback Window (Days)", 30, 252, 120, 10, key="lookback_window_slider",
+    help="Number of days for rolling calculations like Half-Life and Spread Std Dev to prevent lookahead bias."
+)
 min_overlap_pct = st.sidebar.slider(
     "Minimum Data Overlap (%)", 0, 100, 80, 5, key="overlap_filter",
     help="Minimum percentage of the selected date range where both instruments must have price data."
@@ -1229,7 +1244,7 @@ with tab1:
     try:
         if selected_technique_single == TECHNIQUE_COINTEGRATION:
             calculation_function = find_cointegrated_pairs
-            found_pairs_data = calculation_function(price_data, significance_level=coint_p_value_threshold)
+            found_pairs_data = calculation_function(price_data, significance_level=coint_p_value_threshold, lookback_window=lookback_window)
             metric_name, metric_format, sort_ascending = "p_value", ".4f", True
             extra_metric_name, extra_metric_format = "half_life", ".2f"
         elif selected_technique_single == TECHNIQUE_CORRELATION:
@@ -1303,8 +1318,8 @@ with tab1:
                 if not common_norm_index.empty:
                     spread_norm = series1_norm.loc[common_norm_index] - series2_norm.loc[common_norm_index]
                     if not spread_norm.empty:
-                        # Calculate Std Dev of the spread values directly, not returns
-                        spread_vol = calculate_volatility(spread_norm, use_returns=False, annualize=False) # Changed parameters
+                        # Calculate Std Dev of the spread over the lookback window to avoid lookahead bias
+                        spread_vol = calculate_volatility(spread_norm, use_returns=False, annualize=False, window=lookback_window)
 
                 # --- Add debugging output for each pair ---
                 if DEBUG_MODE:
@@ -1552,7 +1567,7 @@ with tab1:
 
         st.write(f"Comparing techniques: {', '.join([t.split('(')[0].strip() for t in selected_techniques_multi])}")
         st.write(f"Data Range Analyzed: {actual_start_date_comp} to {actual_end_date_comp}") # Show actual range
-        st.write(f"Filters Applied: Min Overlap {min_overlap_pct}%, Spread Std Dev Range {volatility_range[0]:.2f}-{volatility_range[1]:.2f}") # Renamed filter
+        st.write(f"Filters Applied: Lookback Window {lookback_window} days, Min Overlap {min_overlap_pct}%, Spread Std Dev Range {volatility_range[0]:.2f}-{volatility_range[1]:.2f}")
         st.divider()
 
         # Get series for the selected instrument once
@@ -1580,7 +1595,7 @@ with tab1:
                 # --- (Similar try-except block as in tab1 to get raw pairs for 'technique') ---
                 if technique ==                TECHNIQUE_COINTEGRATION:
                     calculation_function_comp = find_cointegrated_pairs
-                    found_pairs_data_comp = calculation_function_comp(price_data, significance_level=coint_p_value_threshold)
+                    found_pairs_data_comp = calculation_function_comp(price_data, significance_level=coint_p_value_threshold, lookback_window=lookback_window)
                     metric_name_comp, metric_format_comp, sort_ascending_comp = "p_value", ".4f", True
                     extra_metric_name_comp, extra_metric_format_comp = "half_life", ".2f"
                 elif technique == TECHNIQUE_CORRELATION:
@@ -1638,8 +1653,8 @@ with tab1:
                     if not common_norm_index_comp.empty:
                         spread_norm_comp = series1_norm_comp.loc[common_norm_index_comp] - series2_norm_comp.loc[common_norm_index_comp]
                         if not spread_norm_comp.empty:
-                            # Calculate Std Dev of the spread values directly, not returns
-                            spread_vol_comp = calculate_volatility(spread_norm_comp, use_returns=False, annualize=False) # Changed parameters
+                            # Calculate Std Dev of the spread over the lookback window to avoid lookahead bias
+                            spread_vol_comp = calculate_volatility(spread_norm_comp, use_returns=False, annualize=False, window=lookback_window)
 
                     if overlap_pct_comp < min_overlap_pct: continue
                     # Check against the new spread_vol calculation
@@ -1886,4 +1901,3 @@ elif price_data is None: # General catch for other None cases
     st.error("❌ Failed to load or process data. Check data source settings and file content.")
 elif price_data.empty: # General catch for empty dataframe after processing
     st.warning("⚠️ No price data available for the selected source, symbols, and date range after processing.")
-
